@@ -1,0 +1,21 @@
+# Raw and derived data — never commit, documented in data/README.md instead
+data/raw/
+data/interim/
+data/processed/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Env / secrets
+.env

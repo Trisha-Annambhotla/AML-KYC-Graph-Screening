@@ -1,7 +1,37 @@
+Directory structure:
+└── KYC/
+    ├── README.md
+    ├── requirements.txt
+    └── data/
+        └── README.md
+
+================================================
+FILE: README.md
+================================================
+FDS Project
+
+
+================================================
+FILE: requirements.txt
+================================================
+pandas>=2.0
+numpy>=1.24
+rapidfuzz>=3.0
+networkx>=3.0
+scikit-learn>=1.3
+matplotlib>=3.7
+seaborn>=0.12
+jupyter>=1.0
+ipykernel>=6.25
+
+
+================================================
+FILE: data/README.md
+================================================
 # Data Provenance
 
 Raw data is not committed to this repository (see .gitignore). This file is
-the record of what was used, where it came from, and when — per the
+the record of what was used, where it came from, and when â€” per the
 point-in-time snapshot policy (Charter Section 1.4). No re-pulls mid-project.
 
 ## 1. UK FCDO Sanctions List
@@ -11,7 +41,7 @@ point-in-time snapshot policy (Charter Section 1.4). No re-pulls mid-project.
 - Downloaded: 2026-08-02
 - Local file: `data/raw/fcdo_sanctions/fcdo.csv`
 - Row count: 6,261
-- License: OpenSanctions — free for non-commercial use
+- License: OpenSanctions â€” free for non-commercial use
 - SHA256: <paste output of `sha256sum` / `Get-FileHash` here>
 
 ## 2. PEP Dataset
@@ -22,9 +52,9 @@ point-in-time snapshot policy (Charter Section 1.4). No re-pulls mid-project.
 - Local file: `data/raw/pep/pep.csv`
 - Row count (pre-filter): <fill in>
 - Row count (post `contains gb` filter, applied in code not at source): <fill in>
-- Known issue: raw export has UTF-8-as-Latin-1 mojibake in non-ASCII names —
+- Known issue: raw export has UTF-8-as-Latin-1 mojibake in non-ASCII names â€”
   fixed in `src/pep_cleaning.py`, not at the source file.
-- License: OpenSanctions — free for non-commercial use
+- License: OpenSanctions â€” free for non-commercial use
 - SHA256: <paste hash here>
 
 ## 3. UK Companies House PSC Snapshot
@@ -41,3 +71,4 @@ point-in-time snapshot policy (Charter Section 1.4). No re-pulls mid-project.
 
 - Single fixed download date per source, logged above. No mid-project re-pulls.
 - Any dataset added later must get its own dated entry here before use.
+

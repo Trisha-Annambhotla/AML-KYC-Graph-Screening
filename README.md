@@ -14,6 +14,61 @@ politically exposed person (PEP)?**
 
 **Short answer: no, not with this data.** See [Results](#results).
 
+## How it works
+
+### System architecture
+
+```mermaid
+flowchart LR
+    subgraph SRC["Data sources (downloaded 2026-08-02)"]
+        PSC["Companies House PSC<br/>snapshot, 1 of 32 files"]
+        PEP["OpenSanctions<br/>PEP list"]
+        SAN["UK FCDO<br/>sanctions list"]
+    end
+    PRE["Preprocessing<br/>clean names, fix encoding,<br/>keep UK PEPs"]
+    MAT["Phase 1: Matching<br/>owners vs lists,<br/>strong / weak tiers"]
+    SPOT["Phase 1b: Spot-check<br/>hand-label a sample<br/>(pending)"]
+    GR["Phase 2: Graph<br/>owners -> companies"]
+    FE["Phase 3: Features<br/>4 features + label<br/>per company"]
+    MOD["Phase 4: Models<br/>Logistic Regression vs<br/>Random Forest vs baselines"]
+    CS["Phase 5: Case studies<br/>why the models fail"]
+    DASH["Dashboard<br/>Streamlit + pyvis"]
+
+    PSC --> PRE
+    PEP --> PRE
+    SAN --> PRE
+    PRE --> MAT --> GR --> FE --> MOD --> CS
+    MAT -.-> SPOT
+    GR --> DASH
+    FE --> DASH
+    MOD --> DASH
+    CS --> DASH
+```
+
+### Data pipeline: files produced at each phase
+
+```mermaid
+flowchart TD
+    R1["raw PSC part 1of32<br/>JSON lines"] --> I1["interim/psc_clean.csv<br/>499,971 owner rows"]
+    R2["raw pep.csv<br/>769,044 rows"] --> I2["interim/pep_clean.csv<br/>7,990 UK PEPs"]
+    R3["raw fcdo.csv<br/>6,261 entities"] --> I3["interim/sanctions_clean.csv<br/>19,610 names + aliases"]
+    I1 --> M["processed/matches.csv<br/>4,897 matches: 52 strong, 4,845 weak"]
+    I2 --> M
+    I3 --> M
+    I1 --> G["processed/graph.pkl, nodes.csv, edges.csv<br/>885,449 nodes, 499,142 edges"]
+    M --> G
+    G --> F["processed/features.csv<br/>406,715 companies, 52 positives"]
+    F --> P["processed/predictions.csv<br/>406,715 out-of-fold scores"]
+    F --> MET["results/metrics.csv<br/>10 rows: 2 label runs x 5 methods"]
+    P --> CS["docs/case_studies.md<br/>+ results/case_*.png, 4 cases"]
+    M --> SC["docs/spot_check_sample.csv<br/>100 matches to hand-label"]
+```
+
+Design choices and the evidence behind them are in
+[docs/design_decisions.md](docs/design_decisions.md); how the graph and the
+features are built, with a worked example, is in
+[docs/methodology.md](docs/methodology.md).
+
 ## Folder layout
 
 ```
@@ -102,6 +157,30 @@ that it is cached. Pages:
   button that opens it in Investigate.
 
 The dashboard works offline (the network library is embedded in the page).
+
+### Screenshots
+
+*Placeholders: the image files go in `docs/screenshots/`; see
+[docs/screenshots/README.md](docs/screenshots/README.md) for what each one
+should show.*
+
+**Overview page**: key numbers, list matches and the model comparison table.
+
+![Overview page](docs/screenshots/overview.png)
+
+**Investigate page, network view**: the 2-hop network around company
+00855291, one corporate owner (Travis Perkins Financing Company No.3)
+controlling 8 companies.
+
+![Investigate page with network view](docs/screenshots/investigate_network.png)
+
+**"Why this score?" panel**: the plain-English facts behind one company.
+
+![Why this score? panel](docs/screenshots/why_this_score.png)
+
+**A case study**: the highest-scoring false positive (company 00855291).
+
+![Case study](docs/screenshots/case_study.png)
 
 ## Results
 

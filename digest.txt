@@ -6,13 +6,17 @@ Directory structure:
     │   └── dashboard.py
     ├── docs/
     │   ├── case_studies.md
+    │   ├── design_decisions.md
     │   ├── feature_stats.md
     │   ├── graph_stats.md
     │   ├── implementation_plan.md
     │   ├── limitations.md
     │   ├── match_precision.md
+    │   ├── methodology.md
     │   ├── preprocessing_log.md
-    │   └── spot_check_sample.csv
+    │   ├── spot_check_sample.csv
+    │   └── screenshots/
+    │       └── README.md
     ├── results/
     │   ├── feature_importance.csv
     │   ├── metrics.csv
@@ -62,6 +66,61 @@ politically exposed person (PEP)?**
    companies, against simple baselines.
 
 **Short answer: no, not with this data.** See [Results](#results).
+
+## How it works
+
+### System architecture
+
+```mermaid
+flowchart LR
+    subgraph SRC["Data sources (downloaded 2026-08-02)"]
+        PSC["Companies House PSC<br/>snapshot, 1 of 32 files"]
+        PEP["OpenSanctions<br/>PEP list"]
+        SAN["UK FCDO<br/>sanctions list"]
+    end
+    PRE["Preprocessing<br/>clean names, fix encoding,<br/>keep UK PEPs"]
+    MAT["Phase 1: Matching<br/>owners vs lists,<br/>strong / weak tiers"]
+    SPOT["Phase 1b: Spot-check<br/>hand-label a sample<br/>(pending)"]
+    GR["Phase 2: Graph<br/>owners -> companies"]
+    FE["Phase 3: Features<br/>4 features + label<br/>per company"]
+    MOD["Phase 4: Models<br/>Logistic Regression vs<br/>Random Forest vs baselines"]
+    CS["Phase 5: Case studies<br/>why the models fail"]
+    DASH["Dashboard<br/>Streamlit + pyvis"]
+
+    PSC --> PRE
+    PEP --> PRE
+    SAN --> PRE
+    PRE --> MAT --> GR --> FE --> MOD --> CS
+    MAT -.-> SPOT
+    GR --> DASH
+    FE --> DASH
+    MOD --> DASH
+    CS --> DASH
+```
+
+### Data pipeline: files produced at each phase
+
+```mermaid
+flowchart TD
+    R1["raw PSC part 1of32<br/>JSON lines"] --> I1["interim/psc_clean.csv<br/>499,971 owner rows"]
+    R2["raw pep.csv<br/>769,044 rows"] --> I2["interim/pep_clean.csv<br/>7,990 UK PEPs"]
+    R3["raw fcdo.csv<br/>6,261 entities"] --> I3["interim/sanctions_clean.csv<br/>19,610 names + aliases"]
+    I1 --> M["processed/matches.csv<br/>4,897 matches: 52 strong, 4,845 weak"]
+    I2 --> M
+    I3 --> M
+    I1 --> G["processed/graph.pkl, nodes.csv, edges.csv<br/>885,449 nodes, 499,142 edges"]
+    M --> G
+    G --> F["processed/features.csv<br/>406,715 companies, 52 positives"]
+    F --> P["processed/predictions.csv<br/>406,715 out-of-fold scores"]
+    F --> MET["results/metrics.csv<br/>10 rows: 2 label runs x 5 methods"]
+    P --> CS["docs/case_studies.md<br/>+ results/case_*.png, 4 cases"]
+    M --> SC["docs/spot_check_sample.csv<br/>100 matches to hand-label"]
+```
+
+Design choices and the evidence behind them are in
+[docs/design_decisions.md](docs/design_decisions.md); how the graph and the
+features are built, with a worked example, is in
+[docs/methodology.md](docs/methodology.md).
 
 ## Folder layout
 
@@ -151,6 +210,30 @@ that it is cached. Pages:
   button that opens it in Investigate.
 
 The dashboard works offline (the network library is embedded in the page).
+
+### Screenshots
+
+*Placeholders: the image files go in `docs/screenshots/`; see
+[docs/screenshots/README.md](docs/screenshots/README.md) for what each one
+should show.*
+
+**Overview page**: key numbers, list matches and the model comparison table.
+
+![Overview page](docs/screenshots/overview.png)
+
+**Investigate page, network view**: the 2-hop network around company
+00855291, one corporate owner (Travis Perkins Financing Company No.3)
+controlling 8 companies.
+
+![Investigate page with network view](docs/screenshots/investigate_network.png)
+
+**"Why this score?" panel**: the plain-English facts behind one company.
+
+![Why this score? panel](docs/screenshots/why_this_score.png)
+
+**A case study**: the highest-scoring false positive (company 00855291).
+
+![Case study](docs/screenshots/case_study.png)
 
 ## Results
 
@@ -452,9 +535,7 @@ def network_html(graph, center: str, companies) -> tuple:
                     '"interaction": {"hover": true}}')
     # pyvis's template also loads Bootstrap from a CDN for menus this view does not
     # use; drop it so the dashboard works offline and makes no outside requests.
-    html = "\n".join(line for line in net.generate_html().splitlines()
-                     if "cdn.jsdelivr.net/npm/bootstrap" not in line)
-    return html, len(sub), total, truncated
+    return inv.strip_cdn_lines(net.generate_html()), len(sub), total, truncated
 
 
 def page_investigate():
@@ -692,6 +773,47 @@ Risky companies found in the top k (pooled out-of-fold scores):
 - **Biggest disagreement on a risky company:** 09132366 — Logistic Regression rank 4,848, Random Forest rank 406,668.
 - **Why they differ:** Logistic Regression can only move a score smoothly up or down along each feature, so similar companies get similar scores. Random Forest scores small groups of companies with near-identical values by how many training positives they held. With ~40 positives per training fold that lets it memorise exact profiles (cases 2 and 4 are the two sides of one memorised profile). It ranks 43 of the 52 risky companies higher than Logistic Regression does, without either being useful.
 - **Neither model is useful at a realistic review size:** in the top 1,000 neither finds a single risky company. Further down, Random Forest finds 12 by k = 50,000 and Logistic Regression 8, against 6.4 expected by chance and 13 for the simple shared-address rule. These are small counts from 52 positives, so the differences are not reliable, and neither model beats the baselines (Checkpoint 4).
+
+
+
+================================================
+FILE: docs/design_decisions.md
+================================================
+# Design decisions
+
+Every parameter below was chosen or changed at a checkpoint, based on what
+the pilot data showed. "Evidence" is the observation that drove the choice;
+"Checkpoint" says when it was decided (the phases are in
+[implementation_plan.md](implementation_plan.md)). Where a value was set in
+the plan and not tuned, the table says so.
+
+## Main decisions
+
+| # | Decision | Value chosen | Evidence | Checkpoint |
+|---|---|---|---|---|
+| 1 | **Fuzzy match score** | rapidfuzz `token_sort_ratio` >= 90 on normalised names | Set in the plan, **not tuned**. It only decides which pairs are *candidates*; whether a candidate counts as a label is decided by the strong-match rule (rows 2-4). In the final (Mode A) run, 1,773 of the 4,845 weak matches are fuzzy (score < 100), e.g. "Ian Wright" vs "Iain Wright" (95); 2 of the 52 strong matches are fuzzy too (scores 90.3 and 95.2), accepted because the birth month and year agree. | Plan, Phase 1 |
+| 2 | **Strong-match rule: Mode A vs Mode B** | **Mode A** (name score >= 90 + same birth month and year) when both files have birth columns; otherwise Mode B (exact name + >= 3 words + nationality consistent with the list). Chosen automatically per list. | The first interim files had no birth dates, so Mode B was the only option: it gave 17 companies. After the PSC and sanctions loaders kept birth month/year, Mode A gave **52 companies** (46 PEP, 6 sanctions). Birth dates are much stronger evidence of "same person" than a name alone. | Checkpoint 1; Mode A active after the 2026-10-08 re-processing |
+| 3 | **Apostrophe rule** (Mode B) | Count name words with apostrophes removed | Found in the Mode B run: "Paul O'Neill" normalises to "paul o neill" = 3 words, so it passed the 3-word rule. **9 companies** (O'Neill, O'Brien, O'Toole) were strong only because of this, all very common names. | Checkpoint 1 |
+| 4 | **Short-alias rule** (companies) | A strong company match needs >= 2 real words (tokens of 2+ characters) | **8 of the 10** strong company matches were 1-3 letter or single-word sanctions aliases ("CP", "IAP", "SIG", "VSK", "NALU", "AMANA", "B&H") matching unrelated UK companies such as "Sig Plc". Only "Nord Gold Plc" looked genuine. With rules 3 and 4, Mode B strong companies fell from 35 to 17. | Checkpoint 1 |
+| 5 | **Gate of ~30 companies** | Stop and choose a fallback if fewer than ~30 companies have a strong match | Set in the plan as the minimum for a meaningful model comparison. Mode B gave **17** (below the gate): the project was declared a pilot, with the combined PEP + sanctions label. Mode A later gave **52**, above the gate. | Plan; triggered at Checkpoint 1 (Mode B) |
+| 6 | **Rejected sensitivity label "weak >= 95"** | Not used | A weak-match breakdown (Mode B run) showed **2,739** weak matches fail only because the name has two words: exact common names like "David Williams", mostly different people. A score-95 rule would have added thousands of these as positives. | Phase 1 gate decision |
+| 7 | **Address cap** | Ignore any address key shared by **more than 50 companies** (in feature 1, `shared_address_count` and `split_group_id`) | Before the cap, one positive's co-owners at the virtual office **71-75 Shelton Street, WC2H 9JQ** (~3,000 companies) gave **2,841** companies feature 1 = 1, none of them risky. The cap removes **206** keys (32,234 companies), the largest being virtual offices: 20-22 Wenlock Road (3,454), Shelton Street (2,835), 27 Old Gloucester Street (1,276). After it, feature 1 is non-zero for 7 companies. 50 is a judgement call, not tuned. | Checkpoint 3 |
+| 8 | **`split_group_id` for cross-validation** | 5-fold `GroupKFold` grouped by ownership component **merged with companies sharing a (capped) address key** | Companies linked only through an address sit in different ownership components, so a component-based split could put them in train and test at once. Merging gives **305,990** groups (from 387,944 components); the 52 positives sit in 44 groups. Case studies later confirmed the value of grouping: Peter Caruana's 8 companies always share a test fold, so they cannot vouch for each other. | Checkpoint 3 |
+| 9 | **`label_weak` is report-only** | Never a training label; no `label_weak` sensitivity run | 4,288 companies have a strong or weak match (`label_weak`), against 52 with a strong one. In Mode A a weak match means the name is similar but the birth month/year do not agree (or are missing): mostly **different people** with the same name. | Checkpoint 3 |
+| 10 | **Network view limits** (dashboard) | At most **2 hops** from the selected company, at most **150 nodes**, closest and flagged nodes first; the page says when the view is cut | The largest ownership component has **414** nodes and one owner (Peter Valaitis) controls **227** companies: 2 hops around one of his companies already reaches 228 nodes, too many to read. 2 hops shows a company's owners and their other companies, which is what an investigator checks first. The limits are for readability, not from model evidence. | Dashboard build |
+
+## Other decisions
+
+| Decision | Value chosen | Evidence | Checkpoint |
+|---|---|---|---|
+| PEP job-title rows | Remove names containing "bishop of" / "archbishop" (19 rows); do **not** use "rt rev" | "The Rt Rev. the Lord Bishop of St. Albans" is a job title, not a person. "rt rev" would also remove "The Rt Rev. the Lord Harries of Pentregarth", a real person. | Data fix before Phase 1 |
+| Person node identity | `normalised name + postcode` | Name + nationality would merge every "John Smith" (British) into one fake hub. Name + postcode merges the same person across companies (**8,627** people control 2+ companies) while keeping namesakes apart. | Plan, Phase 2 |
+| Feature 1 leakage rule | Flagged owners removed on **both** sides of owner and address links | The scope's "flagged 1-hop neighbour" equals the label. Removing only a company's own flagged owner would still let it count a sister company through that same owner's address. | Checkpoint 3 |
+| Feature 1 stays a model feature | Kept, and reported as near-constant | It is in the project scope; it is non-zero for only 7 companies, none risky. | Phase 4 brief |
+| Second rule baseline | Rank by `shared_address_count` alone | Feature 1 is almost always 0, so rule 1 (feature 1, then shared address) ranks almost exactly like rule 2; both are shown. | Phase 4 brief |
+| Sensitivity runs | PEP-only (46 positives); no sanctions-only run | Only 6 sanctions positives, about 1 per test fold: too few to train on. | Phase 4 brief |
+| `shortest_distance_to_flagged` | Stored, **not** added to the models | All 52 positives are unreachable from any other flagged owner (value -1); only 5 companies in the dataset can reach one, none risky. | Phase 7 |
+| Hub component | Owner controlling **100+** companies | Marks formation-agent clusters such as the Valaitis group (227 companies); 1,490 companies, no positives. Analysis only. | Checkpoint 3 |
 
 
 
@@ -1159,6 +1281,159 @@ Warning: 50 strong rows are still unlabelled.
 
 
 ================================================
+FILE: docs/methodology.md
+================================================
+# Methodology: graph construction and feature engineering
+
+This explains, in plain language, how the project turns a list of company
+owners into a network and then into four numbers per company. The code is
+in `src/graph_builder.py` (the graph) and `src/features.py` (the features);
+the choices behind each step, with evidence, are in
+[design_decisions.md](design_decisions.md).
+
+## 1. Starting point: owner records
+
+Companies House publishes, for every UK company, its **persons with
+significant control (PSCs)**: the people or companies that own or control
+it. Each record says *who* (a name), *which company* (a company number),
+*where* (a correspondence address) and *how* (e.g. "owns 75-100% of the
+shares"). We use one of the 32 snapshot files: 499,971 records about
+406,715 companies.
+
+Separately, each owner has been matched against the PEP and sanctions lists
+(Phase 1). A **strong** match (name similar enough *and* the same birth
+month and year) makes that owner **flagged**.
+
+## 2. Building the graph
+
+A graph is a set of **nodes** (things) joined by **edges** (relationships).
+
+**Nodes.** There are three kinds:
+
+| Node | One per | Identified by |
+|---|---|---|
+| Company | company number | `company:<number>` |
+| Person (individual owner) | distinct person | name + postcode, e.g. `person:bob david lee\|YO1 2BB` |
+| Corporate owner | owning company or legal body | its name |
+
+The person identity is the important choice. The register has no personal
+ID, so the same person controlling three companies appears in three
+separate records. Joining records with the **same name at the same
+postcode** turns them into one node, which is how we see that one person
+controls several companies (8,627 people do). Using the postcode, not just
+the name, stops every "John Smith" in the country collapsing into one fake
+super-owner.
+
+**Edges.** One edge from each owner to each company it controls, labelled
+with the type of control. If the same owner is listed twice for the same
+company, the two records become one edge.
+
+**Flags.** Owners with a strong list match are marked `flagged` (PEP,
+sanctions, or both).
+
+**Address keys.** Each owner record also gets an **address key**: the
+postcode plus the first line of the address, lowercased (e.g.
+`yo1 2bb | 9 mill road`). Addresses are *not* nodes; they are only used to
+spot companies whose owners share an address. Addresses used by more than
+50 companies (virtual offices, formation agents, accountants) are ignored,
+because sharing one says nothing about a real connection.
+
+**Connected groups.** Following edges in either direction, companies and
+owners that are linked, even indirectly, form a **connected component**.
+Most components are tiny: 79% are one company and one owner.
+
+## 3. The label
+
+A company is **risky (`label = 1`)** if at least one of its *direct* owners
+is flagged. That gives 52 risky companies out of 406,715.
+
+## 4. The four features
+
+For every company we compute four numbers. Together with the label, they
+are what the models learn from.
+
+1. **`flagged_neighbour_companies`**: how many *other* risky companies are
+   connected to this one through an owner who is **not flagged** (a shared
+   co-owner), or through owners sharing an address key.
+   **Leakage guard:** flagged owners are removed before counting, on both
+   sides. The obvious version, "does it have a flagged owner next to it?",
+   *is* the label, so the model would be handed the answer. With the guard,
+   a risky company never gets credit for its own flagged owner.
+2. **`shared_address_count`**: how many *other* companies have at least one
+   owner at the same (not overcrowded) address.
+3. **`degree`**: how many owners the company has.
+4. **`component_size`**: how many nodes (companies + owners) are in its
+   connected group.
+
+Two extra columns are kept for analysis but **not** given to the models:
+`shortest_distance_to_flagged` (hops to the nearest flagged owner, again
+ignoring the company's own flagged owners; -1 if none can be reached) and
+`split_group_id` (connected group merged with address-sharing companies,
+used to keep linked companies together when splitting data into training
+and test sets).
+
+## 5. Worked example
+
+Three companies, three people. This example was run through the real code
+(`build_graph` and `compute_features`) to check every number.
+
+| Owner | Owns | Address | Flagged? |
+|---|---|---|---|
+| Ann Clare Hart | Company A | 1 Rose Lane, Leeds, LS1 1AA | **yes (PEP)** |
+| Bob David Lee | Companies A and B | 9 Mill Road, York, YO1 2BB | no |
+| Cara Joan Moss | Company C | 9 Mill Road, York, YO1 2BB | no |
+
+```mermaid
+flowchart LR
+    Ann(["Ann (FLAGGED, PEP)"]) --> A["Company A"]
+    Bob(["Bob"]) --> A
+    Bob --> B["Company B"]
+    Cara(["Cara"]) --> C["Company C"]
+    Bob -. "same address<br/>9 Mill Road, YO1 2BB" .- Cara
+```
+
+The graph has 6 nodes (3 companies, 3 people) and 4 edges. Bob owns two
+companies, so A, B, Ann and Bob form one connected group; C and Cara form
+another. The dotted line is *not* an edge: it only marks that Bob and Cara
+share an address key.
+
+| | Company A | Company B | Company C |
+|---|---|---|---|
+| **label** | **1** (Ann is flagged) | 0 | 0 |
+| `degree` | 2 (Ann, Bob) | 1 (Bob) | 1 (Cara) |
+| `component_size` | 4 (A, B, Ann, Bob) | 4 | 2 (C, Cara) |
+| `shared_address_count` | 2 (B and C use 9 Mill Road) | 2 (A and C) | 2 (A and B) |
+| `flagged_neighbour_companies` | **0** | 1 (A, via co-owner Bob) | 1 (A, via the shared address) |
+| (plan's version: owner links only) | 0 | 1 | 0 |
+| `shortest_distance_to_flagged` | **-1** | 3 (B -> Bob -> A -> Ann) | -1 |
+| `split_group_id` | same group | same group | same group |
+
+What the example shows:
+
+- **The leakage guard works.** A is risky because of Ann, yet its
+  `flagged_neighbour_companies` is **0** and its distance is **-1**: Ann is
+  removed when A's own features are computed, so A's features do not
+  contain its label.
+- **Risk "spreads" only to neighbours.** B gets 1 because it shares a
+  non-flagged co-owner (Bob) with risky A; C gets 1 only because Cara
+  shares Bob's address. The plan's original owner-only version gives C 0.
+- **The split keeps linked companies together.** C is in a different
+  connected group from A and B, but it shares an address with them, so all
+  three get the same `split_group_id` and always land in the same
+  cross-validation fold.
+
+## 6. Why this did not work on the real data
+
+On the real sample, risky companies almost never have the neighbours that
+features 1 and `shortest_distance_to_flagged` look for: feature 1 is
+non-zero for 7 companies (none risky) and every risky company has distance
+-1. And 56% of all companies share one identical feature profile (one
+owner, a two-node group, no shared address). The details are in
+[case_studies.md](case_studies.md) and [limitations.md](limitations.md).
+
+
+
+================================================
 FILE: docs/preprocessing_log.md
 ================================================
 # Preprocessing Log — 2026-09-09 12:53
@@ -1306,6 +1581,26 @@ SC572006,Drew Murray,British,1992,7,Andrew Murray,pep,1947-01-29,weak,91.7,weak|
 15084435,Ansar Ali,British,1995,7,Ali Ansari,sanctions,1968-12-26,weak,94.7,weak|sanctions|90-94.9,230,individual-person-with-significant-control,alias,A,442830,NK-HQCiUW9iMXrPCKVMQx5SKh,
 15093885,Haider Ali,Pakistani,2003,10,Ali Haidar,sanctions,1962,weak,90.0,weak|sanctions|90-94.9,230,individual-person-with-significant-control,canonical,A,486434,Q2646694,
 15121825,Muhammad Ahmad,British,1979,6,Muhammad al-Ahmad,sanctions,1961,weak,90.3,weak|sanctions|90-94.9,230,individual-person-with-significant-control,alias,A,445416,Q60575926,
+
+
+
+================================================
+FILE: docs/screenshots/README.md
+================================================
+# Dashboard screenshots
+
+The main `README.md` shows these four images. Take them from the running
+dashboard (`streamlit run app/dashboard.py`) and save them here with exactly
+these names (PNG, browser window about 1400 px wide):
+
+| File | Page | What to capture |
+|---|---|---|
+| `overview.png` | Overview | The four key numbers, the list-matches table and the model comparison table. |
+| `investigate_network.png` | Investigate, company `00855291` | The company header, the features and scores tables, and the network view (Travis Perkins group, 9 nodes). |
+| `why_this_score.png` | Investigate, company `10277215` | The "Why this score?" list (Jack Dromey PEP match, "No connection to any other flagged owner", the 4,917 feature twins). |
+| `case_study.png` | Case studies | Case 2, "The highest-scoring false positive", with its static drawing expanded. |
+
+Until the files exist, the images in `README.md` show as broken links.
 
 
 
@@ -3317,6 +3612,19 @@ def ego_network(graph: nx.DiGraph, center: str, max_hops: int = MAX_HOPS,
             keep.append(n)
     sub = graph.subgraph(keep).copy()
     return sub, total, total > len(keep)
+
+
+def strip_cdn_lines(html: str, marker: str = "cdn.jsdelivr.net/npm/bootstrap") -> str:
+    """
+    Drop the lines of pyvis's page that load Bootstrap from a CDN (menus the
+    dashboard does not use), so the page works offline.
+
+    Splits on "\\n" only. str.splitlines() would also split on characters such
+    as "\\x85" and "\\u2028", which occur inside JavaScript strings in the
+    embedded vis-network library; re-joining them as newlines breaks the
+    script and leaves the network view blank.
+    """
+    return "\n".join(line for line in html.split("\n") if marker not in line)
 
 
 def score_table(row, n: int) -> pd.DataFrame:
@@ -5635,6 +5943,32 @@ def test_search_owners():
                            "flag_source": ["pep", "", ""], "n_companies": [8, 1, 1]})
     assert inv.search_owners(owners, "peter")["node_id"].tolist() == ["a", "b"]
     assert inv.search_owners(owners, "al").empty  # fewer than 3 letters
+
+
+def test_strip_cdn_lines_keeps_javascript_intact():
+    """Regression: splitlines() broke a JS string containing \x85 inside the
+    embedded vis-network library, leaving the network view blank."""
+    html = ('<link href="https://cdn.jsdelivr.net/npm/bootstrap/x.css">\n'
+            '<script>var ws = "\t\x85\u2028\u2029 ";</script>\n'
+            '<script src="https://cdn.jsdelivr.net/npm/bootstrap/x.js"></script>\n'
+            '<div id="mynetwork"></div>')
+    out = inv.strip_cdn_lines(html)
+    assert "bootstrap" not in out
+    assert '<script>var ws = "\t\x85\u2028\u2029 ";</script>' in out
+    assert out.count("\n") == 1
+
+
+def test_real_pyvis_page_survives_cdn_strip():
+    from pyvis.network import Network
+    net = Network(cdn_resources="in_line")
+    net.add_node(1)
+    raw = net.generate_html()
+    out = inv.strip_cdn_lines(raw)
+    kept = [line for line in raw.split("\n") if "cdn.jsdelivr.net/npm/bootstrap" not in line]
+    assert out == "\n".join(kept)          # nothing else changed
+    assert out.count("\x85") == raw.count("\x85")
+    assert "new vis.Network" in out
+    assert "cdn.jsdelivr.net/npm/bootstrap" not in out
 
 
 

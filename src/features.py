@@ -45,9 +45,13 @@ Extra columns (not model features)
     capped shared address keys -- Phase 4 must use THIS for GroupKFold, so
     address-linked companies never land in different folds),
     flagged_neighbour_via_owner (the plan's original feature 1: link (a)
-    only, kept so both versions can be reported), and is_hub_component (the
-    component contains a PSC controlling 100+ companies, e.g. a formation
-    agent; for analysis only).
+    only, kept so both versions can be reported),
+    shortest_distance_to_flagged (hops on the ownership graph to the nearest
+    strongly flagged owner, ignoring the company's own flagged owners;
+    capped at 6, -1 if unreachable. Flagged nodes are owners, so the
+    possible values are 3, 5, 6 (= 7 or more) and -1; not a model feature),
+    and is_hub_component (the component contains a PSC controlling 100+
+    companies, e.g. a formation agent; for analysis only).
 
 Run directly:
     python src/features.py
@@ -70,12 +74,14 @@ FEATURES_OUTPUT = os.path.join(PROCESSED, "features.csv")
 STATS_OUTPUT = os.path.join(ROOT, "docs", "feature_stats.md")
 
 HUB_MIN_COMPANIES = 100
+MAX_FLAG_DISTANCE = 6
 ADDRESS_KEY_MAX_COMPANIES = 50
 
 FEATURES = ["flagged_neighbour_companies", "shared_address_count", "degree", "component_size"]
 OUTPUT_FIELDS = [
     "company_number", "component_id", "split_group_id", "label", "label_weak", "label_source",
-    *FEATURES, "flagged_neighbour_via_owner", "is_hub_component",
+    *FEATURES, "flagged_neighbour_via_owner", "shortest_distance_to_flagged",
+    "is_hub_component",
 ]
 
 
@@ -100,6 +106,44 @@ def _components(graph: nx.DiGraph):
                for n in comp if graph.nodes[n]["node_type"] != "company"):
             hub_comps.add(cid)
     return comp_id, comp_size, hub_comps
+
+
+def _distance_to_flagged(graph: nx.DiGraph, companies: list, comp_id: dict,
+                         is_flagged: dict) -> dict:
+    """
+    Hops from each company to the nearest strongly flagged owner, on the
+    undirected ownership graph. The company's OWN flagged owners are removed
+    from the search entirely (not targets, not stepping stones), the same
+    rule as feature 1 -- otherwise a labelled company could reach other
+    flagged owners through its own one. Capped at MAX_FLAG_DISTANCE; -1 if
+    no flagged owner is reachable.
+    """
+    und = graph.to_undirected(as_view=True)
+    comps_with_flags = {comp_id[n] for n, f in is_flagged.items() if f}
+    dist = {}
+    for c in companies:
+        if comp_id[c] not in comps_with_flags:
+            dist[c] = -1
+            continue
+        own = {p for p in graph.predecessors(c) if is_flagged[p]}
+        seen, frontier, hops, found = {c} | own, [c], 0, -1
+        while frontier and found == -1:
+            hops += 1
+            nxt = []
+            for n in frontier:
+                for m in und.neighbors(n):
+                    if m in seen:
+                        continue
+                    if is_flagged[m]:
+                        found = hops
+                        break
+                    seen.add(m)
+                    nxt.append(m)
+                if found != -1:
+                    break
+            frontier = nxt
+        dist[c] = -1 if found == -1 else min(found, MAX_FLAG_DISTANCE)
+    return dist
 
 
 def _split_groups(comp_of_company: dict, key_all: dict) -> dict:
@@ -204,6 +248,7 @@ def compute_features(graph: nx.DiGraph):
 
     comp_id, comp_size, hub_comps = _components(graph)
     split_group = _split_groups({c: comp_id[c] for c in companies}, key_all)
+    flag_dist = _distance_to_flagged(graph, companies, comp_id, is_flagged)
 
     rows = [{
         "company_number": c.removeprefix("company:"),
@@ -217,6 +262,7 @@ def compute_features(graph: nx.DiGraph):
         "degree": graph.in_degree(c),
         "component_size": comp_size[comp_id[c]],
         "flagged_neighbour_via_owner": len(via_owner.get(c, ())),
+        "shortest_distance_to_flagged": flag_dist[c],
         "is_hub_component": comp_id[c] in hub_comps,
     } for c in companies]
     df = pd.DataFrame(rows, columns=OUTPUT_FIELDS).sort_values("company_number", ignore_index=True)
@@ -253,7 +299,39 @@ def feature_summary(df: pd.DataFrame, info: dict = None) -> dict:
         "largest_split_group": int(df["split_group_id"].value_counts().max()),
         "positive_split_groups": int(df.loc[df["label"] == 1, "split_group_id"].nunique()),
         "info": info or {},
+        "distance_by_label": (
+            pd.crosstab(df["shortest_distance_to_flagged"], df["label"])
+            .reindex(columns=[0, 1], fill_value=0)
+            if "shortest_distance_to_flagged" in df else None),
     }
+
+
+def _distance_lines(s: dict) -> list:
+    tab = s.get("distance_by_label")
+    if tab is None:
+        return []
+    totals = tab.sum()
+    names = {-1: "unreachable (-1)", MAX_FLAG_DISTANCE: f"{MAX_FLAG_DISTANCE} (= 7 or more)"}
+    rows = [
+        f"| {names.get(d, d)} | {r[0]:,} ({r[0] / totals[0]:.3%}) "
+        f"| {r[1]:,} ({r[1] / totals[1]:.1%}) |"
+        for d, r in tab.iterrows()
+    ]
+    return [
+        "## `shortest_distance_to_flagged` (not a model feature)",
+        "",
+        "Hops on the ownership graph from each company to the nearest strongly "
+        "flagged owner, ignoring the company's own flagged owners (same rule as "
+        f"feature 1); capped at {MAX_FLAG_DISTANCE}, -1 if none is reachable. "
+        "Flagged nodes are owners and paths alternate company/owner, so only odd "
+        "distances (3, 5) occur below the cap. Stored in `features.csv` for "
+        "analysis; not used by the models.",
+        "",
+        "| Distance | label 0 (companies, %) | label 1 (companies, %) |",
+        "|---|---|---|",
+        *rows,
+        "",
+    ]
 
 
 def _cap_lines(s: dict) -> list:
@@ -318,6 +396,7 @@ def write_summary(s: dict, path: str = STATS_OUTPUT):
         f"{s['nonzero']['flagged_neighbour_via_owner']['companies']:,} | "
         f"{s['nonzero']['flagged_neighbour_via_owner']['positives']} |",
         "",
+        *_distance_lines(s),
         "## Feature summary by label",
         "",
     ]

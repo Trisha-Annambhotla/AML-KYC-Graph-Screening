@@ -29,6 +29,16 @@ Generated 2026-10-08 by `src/features.py` from `data/processed/graph.pkl`.
 | `flagged_neighbour_companies` (owner OR address) | 7 | 0 |
 | `flagged_neighbour_via_owner` (plan's original) | 4 | 0 |
 
+## `shortest_distance_to_flagged` (not a model feature)
+
+Hops on the ownership graph from each company to the nearest strongly flagged owner, ignoring the company's own flagged owners (same rule as feature 1); capped at 6, -1 if none is reachable. Flagged nodes are owners and paths alternate company/owner, so only odd distances (3, 5) occur below the cap. Stored in `features.csv` for analysis; not used by the models.
+
+| Distance | label 0 (companies, %) | label 1 (companies, %) |
+|---|---|---|
+| unreachable (-1) | 406,658 (99.999%) | 52 (100.0%) |
+| 3 | 4 (0.001%) | 0 (0.0%) |
+| 5 | 1 (0.000%) | 0 (0.0%) |
+
 ## Feature summary by label
 
 | Feature | label | mean | std | min | 50% | 90% | 99% | max |

@@ -132,3 +132,38 @@ def test_split_group_ignores_capped_addresses():
     # component) but C00 and C01 do not, and the capped address must not join them.
     assert f.loc["C00", "split_group_id"] == f.loc["C11", "split_group_id"]
     assert f.loc["C00", "split_group_id"] != f.loc["C01", "split_group_id"]
+
+
+def test_shortest_distance_to_flagged():
+    # Chain: A <- Q -> B <- R -> C <- S -> D <- P (flagged), so D is labelled.
+    # L and E share two ordinary owners (T, U) and are nowhere near a flag;
+    # I is an isolated company.
+    rows = [("A", "Q", "Q"), ("B", "Q", "Q"),
+            ("B", "R", "R"), ("C", "R", "R"),
+            ("C", "S", "S"), ("D", "S", "S"),
+            ("D", "P", "P"),
+            ("L", "T", "T"), ("E", "T", "T"),
+            ("L", "U", "U"), ("E", "U", "U"),
+            ("I", "V", "V")]
+    f = _graph(rows, flagged=[("D", "P", "pep")])
+    assert f.loc["C", "shortest_distance_to_flagged"] == 3   # C-S-D-P
+    assert f.loc["B", "shortest_distance_to_flagged"] == 5   # B-R-C-S-D-P
+    assert f.loc["A", "shortest_distance_to_flagged"] == 6   # 7 hops, capped at 6
+    assert f.loc["D", "shortest_distance_to_flagged"] == -1  # own flagged owner ignored
+    assert f.loc["L", "shortest_distance_to_flagged"] == -1
+    assert f.loc["I", "shortest_distance_to_flagged"] == -1
+
+
+def test_own_flagged_owner_is_not_a_stepping_stone():
+    # P (flagged) owns A and B; X (flagged) also owns B. For A, the only route
+    # to X is through its own flagged owner P, so A must get -1, not 3.
+    f = _graph([("A", "P", "P"), ("B", "P", "P"), ("B", "X", "X")],
+               flagged=[("A", "P", "pep"), ("B", "X", "sanctions")])
+    assert f.loc["A", "shortest_distance_to_flagged"] == -1
+    # B's own flagged owners are P and X; nothing else is reachable.
+    assert f.loc["B", "shortest_distance_to_flagged"] == -1
+
+
+def test_distance_is_not_a_model_feature():
+    from features import FEATURES
+    assert "shortest_distance_to_flagged" not in FEATURES

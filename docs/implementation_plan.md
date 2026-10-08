@@ -136,28 +136,33 @@ Below is the full plan. Save it in your repo as **`docs/implementation_plan.md`*
 * `results/feature_importance.png`
 * `data/processed/predictions.csv` (out-of-fold scores)
 
-1. **Split:** `GroupKFold` with 5 folds, grouped by `component_id`, so connected companies never end up in both the training and test sets.
+*(Updated 2026-10-08 after Checkpoint 3: split on `split_group_id`, no `label_weak` run, PEP-only sensitivity only, extra k values and lift, second rule baseline.)*
+
+1. **Split:** `GroupKFold` with 5 folds, grouped by **`split_group_id`** (not `component_id`). `split_group_id` is the ownership-graph component merged with companies that share a (capped) address key, so neither owner-linked nor address-linked companies end up in both the training and test sets.
 2. **Logistic Regression:**
    * apply `log1p` to all four features, then `StandardScaler`
    * `class_weight="balanced"`, `max_iter=1000`
 3. **Random Forest:**
    * raw features
    * `n_estimators=300`, `min_samples_leaf=5`, `class_weight="balanced_subsample"`
-4. **Baselines:**
+4. **Features:** the four from Phase 3. Keep `flagged_neighbour_companies` as a model feature (it is in the scope), but note in the results that it is near-constant (non-zero for only 7 companies, none positive).
+5. **Baselines:**
    * (a) random scores
-   * (b) a simple rule: rank by `flagged_neighbour_companies`, then by `shared_address_count`
-5. **Metrics:**
-   * **Main:** PR-AUC (`average_precision_score`), reported as the mean ± std across folds, plus Precision@50 and Precision@100 on the pooled out-of-fold scores.
-   * **Also:** recall at k.
+   * (b) rule 1: rank by `flagged_neighbour_companies`, then by `shared_address_count`
+   * (c) rule 2: rank by `shared_address_count` alone (added because feature 1 is almost always 0)
+6. **Metrics:**
+   * **Main:** PR-AUC (`average_precision_score`), reported as the mean ± std across folds.
+   * **On the pooled out-of-fold scores**, for k = 50, 100, 500 and 1000: precision@k, recall@k, and lift over random (precision@k divided by the positive rate).
    * **Secondary:** ROC-AUC.
    * **Context only:** accuracy at a 0.5 threshold.
-   * If there are fewer positives than k, report k alongside the positive count.
-6. **Interpretation:** report the Logistic Regression coefficients and the Random Forest feature importances (permutation importance on held-out folds).
-7. **Sensitivity runs** (add rows to `metrics.csv`):
-   * using `label_weak`
-   * PEP-only and sanctions-only labels, if each has at least 20 positives
+   * There are fewer positives than k, so report k alongside the positive count.
+7. **Interpretation:** report the Logistic Regression coefficients and the Random Forest feature importances (permutation importance on held-out folds).
+8. **Sensitivity run** (add rows to `metrics.csv`):
+   * **PEP-only label** (46 positives).
+   * No sanctions-only run (only 6 positives).
+   * **No `label_weak` run.** `label_weak` is for reporting only and is never a training label, because in Mode A most weak matches are different people with the same name.
 
-**Checkpoint 4:** show the metrics table and state plainly whether each model beats both baselines.
+**Checkpoint 4:** show the metrics table and state plainly whether each model beats each baseline.
 
 ## Phase 5: Case studies
 

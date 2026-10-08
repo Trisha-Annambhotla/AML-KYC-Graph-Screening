@@ -210,6 +210,19 @@ def ego_network(graph: nx.DiGraph, center: str, max_hops: int = MAX_HOPS,
     return sub, total, total > len(keep)
 
 
+def strip_cdn_lines(html: str, marker: str = "cdn.jsdelivr.net/npm/bootstrap") -> str:
+    """
+    Drop the lines of pyvis's page that load Bootstrap from a CDN (menus the
+    dashboard does not use), so the page works offline.
+
+    Splits on "\\n" only. str.splitlines() would also split on characters such
+    as "\\x85" and "\\u2028", which occur inside JavaScript strings in the
+    embedded vis-network library; re-joining them as newlines breaks the
+    script and leaves the network view blank.
+    """
+    return "\n".join(line for line in html.split("\n") if marker not in line)
+
+
 def score_table(row, n: int) -> pd.DataFrame:
     names = {"random_forest": "Random Forest", "logistic_regression": "Logistic Regression"}
     return pd.DataFrame([

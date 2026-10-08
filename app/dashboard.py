@@ -234,9 +234,7 @@ def network_html(graph, center: str, companies) -> tuple:
                     '"interaction": {"hover": true}}')
     # pyvis's template also loads Bootstrap from a CDN for menus this view does not
     # use; drop it so the dashboard works offline and makes no outside requests.
-    html = "\n".join(line for line in net.generate_html().splitlines()
-                     if "cdn.jsdelivr.net/npm/bootstrap" not in line)
-    return html, len(sub), total, truncated
+    return inv.strip_cdn_lines(net.generate_html()), len(sub), total, truncated
 
 
 def page_investigate():

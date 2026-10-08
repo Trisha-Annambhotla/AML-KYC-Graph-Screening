@@ -113,3 +113,29 @@ def test_search_owners():
                            "flag_source": ["pep", "", ""], "n_companies": [8, 1, 1]})
     assert inv.search_owners(owners, "peter")["node_id"].tolist() == ["a", "b"]
     assert inv.search_owners(owners, "al").empty  # fewer than 3 letters
+
+
+def test_strip_cdn_lines_keeps_javascript_intact():
+    """Regression: splitlines() broke a JS string containing \x85 inside the
+    embedded vis-network library, leaving the network view blank."""
+    html = ('<link href="https://cdn.jsdelivr.net/npm/bootstrap/x.css">\n'
+            '<script>var ws = "\t\x85\u2028\u2029 ";</script>\n'
+            '<script src="https://cdn.jsdelivr.net/npm/bootstrap/x.js"></script>\n'
+            '<div id="mynetwork"></div>')
+    out = inv.strip_cdn_lines(html)
+    assert "bootstrap" not in out
+    assert '<script>var ws = "\t\x85\u2028\u2029 ";</script>' in out
+    assert out.count("\n") == 1
+
+
+def test_real_pyvis_page_survives_cdn_strip():
+    from pyvis.network import Network
+    net = Network(cdn_resources="in_line")
+    net.add_node(1)
+    raw = net.generate_html()
+    out = inv.strip_cdn_lines(raw)
+    kept = [line for line in raw.split("\n") if "cdn.jsdelivr.net/npm/bootstrap" not in line]
+    assert out == "\n".join(kept)          # nothing else changed
+    assert out.count("\x85") == raw.count("\x85")
+    assert "new vis.Network" in out
+    assert "cdn.jsdelivr.net/npm/bootstrap" not in out

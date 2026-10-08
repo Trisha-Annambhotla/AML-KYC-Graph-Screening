@@ -209,6 +209,7 @@ ipykernel>=6.25
 unidecode>=1.3
 streamlit>=1.65
 pyvis>=0.3.2
+pytest>=7.0
 
 
 
@@ -354,7 +355,11 @@ def page_overview():
         "hits@100": m["hits@100"], "hits@1000": m["hits@1000"],
         "accuracy@0.5 (context)": m["accuracy_at_0_5"].round(3),
     })
-    st.dataframe(view, hide_index=True, width="stretch")
+    all_zero = [c for c in view.columns
+                if pd.api.types.is_numeric_dtype(view[c]) and (view[c] == 0).all()]
+    st.dataframe(view.drop(columns=all_zero), hide_index=True, width="stretch")
+    if all_zero:
+        st.caption(f"Hidden because every method scored 0: {', '.join(all_zero)}.")
     st.warning("Neither model beats the baselines; no method puts a risky company in its "
                "top 1,000. Full table and verdicts: `results/metrics.md`.")
     with st.expander("results/metrics.md"):

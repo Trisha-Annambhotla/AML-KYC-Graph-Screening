@@ -12,6 +12,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+import graph_builder  # noqa: E402
 import matching  # noqa: E402
 
 
@@ -21,6 +22,15 @@ def main():
     for k, v in match_counts.items():
         print(f"  {k}: {v}")
     print(f"  -> {matching.MATCHES_OUTPUT}")
+
+    print("\n=== Phase 2: Ownership graph ===")
+    stats = graph_builder.run()
+    for k, v in stats.items():
+        if k != "unmapped":
+            print(f"  {k}: {v}")
+    print(f"  unmapped strong matches: {len(stats['unmapped'])}")
+    print(f"  -> {graph_builder.GRAPH_OUTPUT}")
+    print(f"  -> {graph_builder.STATS_OUTPUT}")
 
 
 if __name__ == "__main__":

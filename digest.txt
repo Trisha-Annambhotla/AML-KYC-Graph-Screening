@@ -1,26 +1,31 @@
 Directory structure:
-└── KYC/
+└── AML-KYC-Graph-Screening/
     ├── README.md
     ├── requirements.txt
-    ├── data/
-    │   └── README.md
     ├── docs/
+    │   ├── graph_stats.md
     │   ├── implementation_plan.md
-    │   └── preprocessing_log.md
+    │   ├── match_precision.md
+    │   ├── preprocessing_log.md
+    │   └── spot_check_sample.csv
     ├── scripts/
     │   ├── run_pipeline.py
     │   └── run_preprocessing.py
     ├── src/
+    │   ├── graph_builder.py
     │   ├── matching.py
     │   ├── name_normalization.py
     │   ├── pep_cleaning.py
     │   ├── psc_loader.py
     │   ├── sanctions_loader.py
+    │   ├── spot_check.py
     │   └── text_encoding.py
     └── tests/
+        ├── test_graph_builder.py
         ├── test_matching.py
         ├── test_name_normalization.py
-        └── test_pep_cleaning.py
+        ├── test_pep_cleaning.py
+        └── test_spot_check.py
 
 ================================================
 FILE: README.md
@@ -44,51 +49,41 @@ unidecode>=1.3
 
 
 ================================================
-FILE: data/README.md
+FILE: docs/graph_stats.md
 ================================================
-# Data Provenance
+# Graph statistics (Phase 2, Checkpoint 2)
 
-Raw data is not committed to this repository (see .gitignore). This file is
-the record of what was used, where it came from, and when â€” per the
-point-in-time snapshot policy (Charter Section 1.4). No re-pulls mid-project.
+Generated 2026-10-08 by `src/graph_builder.py` from `data/interim/psc_clean.csv` and `data/processed/matches.csv`.
 
-## 1. UK FCDO Sanctions List
+## Size
 
-- Source: OpenSanctions, `gb_fcdo_sanctions` dataset
-- URL: https://www.opensanctions.org/datasets/gb_fcdo_sanctions/
-- Downloaded: 2026-08-02
-- Local file: `data/raw/fcdo_sanctions/fcdo.csv`
-- Row count: 6,261
-- License: OpenSanctions â€” free for non-commercial use
-- SHA256: <paste output of `sha256sum` / `Get-FileHash` here>
+| Node type | Count |
+|---|---|
+| company | 406,715 |
+| person | 448,110 |
+| corp | 30,624 |
+| **total nodes** | **885,449** |
+| **edges** (PSC -> company) | **499,142** |
 
-## 2. PEP Dataset
+- People who control 2+ companies (merged by name + postcode): 8,627
+- Person nodes with no postcode (keyed by full address instead): 10,059
 
-- Source: OpenSanctions, PEP dataset
-- URL: https://www.opensanctions.org/datasets/peps/
-- Downloaded: 2026-08-02
-- Local file: `data/raw/pep/pep.csv`
-- Row count (pre-filter): <fill in>
-- Row count (post `contains gb` filter, applied in code not at source): <fill in>
-- Known issue: raw export has UTF-8-as-Latin-1 mojibake in non-ASCII names â€”
-  fixed in `src/pep_cleaning.py`, not at the source file.
-- License: OpenSanctions â€” free for non-commercial use
-- SHA256: <paste hash here>
+## Connected components (weakly connected)
 
-## 3. UK Companies House PSC Snapshot
+- Number of components: 387,944
+- Size (nodes): min 2, median 2, max 414
+- Top 10 sizes: 414, 269, 261, 226, 178, 144, 135, 134, 114, 108
+- Components by size (smallest sizes): 2 nodes: 304,759, 3 nodes: 69,079, 4 nodes: 10,061, 5 nodes: 2,314, 6 nodes: 778, 7 nodes: 344
 
-- Source: Companies House bulk PSC snapshot
-- URL: http://download.companieshouse.gov.uk/en_pscdata.html
-- Snapshot date: 2026-08-02
-- Local files: `data/raw/psc/psc-snapshot-2026-08-02_1of32.txt/` (32 parts, JSONL/.txt)
-- Format: one JSON object per line
-- License: Open Government Licence
-- SHA256 (per part): <paste hashes here, or a manifest file if easier>
+## Flags
 
-## Policy
+- Strongly flagged PSC nodes: 45 (pep: 39, sanctions: 6)
+- Weakly flagged PSC nodes: 4,170
 
-- Single fixed download date per source, logged above. No mid-project re-pulls.
-- Any dataset added later must get its own dated entry here before use.
+## Strong-match mapping check
+
+All 52 strong matches were mapped to a node.
+
 
 
 ================================================
@@ -114,7 +109,7 @@ Below is the full plan. Save it in your repo as **`docs/implementation_plan.md`*
 1. Never read a full CSV into the conversation. Inspect files with pandas `nrows=` or `head`.
 2. Never modify anything in `data/interim/`.
 3. Large outputs go in `data/processed/`, which git ignores. Small results (metrics CSVs, charts, markdown summaries) go in `results/` or `docs/` and are committed.
-4. Each phase is one module in `src/`, with tests in `tests/`. Also add the phase as a step in `scripts/run_pipeline.py`, so the whole pipeline (Phases 1â€“4) can be rerun with one command when new data arrives.
+4. Each phase is one module in `src/`, with tests in `tests/`. Also add the phase as a step in `scripts/run_pipeline.py`, so the whole pipeline (Phases 1–4) can be rerun with one command when new data arrives.
 5. Set `random_state=42` everywhere randomness is used.
 6. At every **checkpoint**, show the summary and wait for approval before continuing.
 7. At the end of every phase, run all tests, then run:
@@ -139,11 +134,11 @@ Below is the full plan. Save it in your repo as **`docs/implementation_plan.md`*
    * Then do a fuzzy pass with blocking. For people, only compare names with the same last word (surname). For companies, only compare names sharing their least common word.
 4. **Scoring:** use rapidfuzz `token_sort_ratio` on `normalized_name`, and keep candidates scoring at least 90.
 5. **Strong vs weak.** Detect which mode applies from the columns present.
-   * **Mode A (birth dates available):** the PSC file has `birth_month`/`birth_year` and the list row has `birth_date`. Strong means score â‰¥ 90 and the same birth year and month. Sanctions `birth_date` may hold several dates separated by `;`, and any one matching counts.
+   * **Mode A (birth dates available):** the PSC file has `birth_month`/`birth_year` and the list row has `birth_date`. Strong means score ≥ 90 and the same birth year and month. Sanctions `birth_date` may hold several dates separated by `;`, and any one matching counts.
    * **Mode B (current files, fallback rule):**
-     * *People:* strong means an exact normalised name match, at least 3 name words, and a nationality consistent with the list's `countries`. Use a small mapping, such as British â†’ gb, Russian â†’ ru, Iranian â†’ ir. An unknown or missing nationality is never strong.
+     * *People:* strong means an exact normalised name match, at least 3 name words, and a nationality consistent with the list's `countries`. Use a small mapping, such as British → gb, Russian → ru, Iranian → ir. An unknown or missing nationality is never strong.
      * *Companies:* strong means an exact normalised name match.
-   * Everything else scoring â‰¥ 90 is weak.
+   * Everything else scoring ≥ 90 is weak.
    * Record in a `rule_used` column whether Mode A or B produced each label.
 6. **Output columns:** `psc_row_id`, `company_number`, `kind`, `psc_name`, `nationality`, `list_name`, `list_source` (pep or sanctions), `seed_source` (canonical or alias, for sanctions), `list_entity_id`, `score`, `tier`, `rule_used`.
 7. **Tests:**
@@ -243,7 +238,7 @@ Below is the full plan. Save it in your repo as **`docs/implementation_plan.md`*
    * (a) random scores
    * (b) a simple rule: rank by `flagged_neighbour_companies`, then by `shared_address_count`
 5. **Metrics:**
-   * **Main:** PR-AUC (`average_precision_score`), reported as the mean Â± std across folds, plus Precision@50 and Precision@100 on the pooled out-of-fold scores.
+   * **Main:** PR-AUC (`average_precision_score`), reported as the mean ± std across folds, plus Precision@50 and Precision@100 on the pooled out-of-fold scores.
    * **Also:** recall at k.
    * **Secondary:** ROC-AUC.
    * **Context only:** accuracy at a 0.5 threshold.
@@ -296,9 +291,38 @@ Below is the full plan. Save it in your repo as **`docs/implementation_plan.md`*
 
 
 ================================================
+FILE: docs/match_precision.md
+================================================
+# Match precision (manual spot-check)
+
+Hand-labelled sample of name matches: `y` = same person/company, `n` = different, `?` = cannot tell. Precision = y / (y + n); `?` and blank rows are excluded.
+
+| Tier | List | Sampled | y | n | ? | Unlabelled | Precision |
+|---|---|---|---|---|---|---|---|
+| weak | all | 50 | 0 | 0 | 0 | 50 | n/a |
+| weak | pep | 26 | 0 | 0 | 0 | 26 | n/a |
+| weak | sanctions | 24 | 0 | 0 | 0 | 24 | n/a |
+| strong | all | 50 | 0 | 0 | 0 | 50 | n/a |
+| strong | pep | 44 | 0 | 0 | 0 | 44 | n/a |
+| strong | sanctions | 6 | 0 | 0 | 0 | 6 | n/a |
+
+**Strong matches were correct 0 out of 0 judged times (n/a).**
+
+Warning: 50 strong rows are still unlabelled.
+
+## Notes
+
+- Strong rows are a census (all strong matches are labelled) unless there were more than the sample cap, so strong precision has no sampling error.
+- Weak sample sizes are small; treat weak precision as indicative only.
+- The labels were judged against Companies House birth month/year and the list's birth date where available; `?` is used when neither side gives enough evidence.
+- If strong precision is below ~70%, tighten the strong rule before freezing labels.
+
+
+
+================================================
 FILE: docs/preprocessing_log.md
 ================================================
-# Preprocessing Log â€” 2026-09-09 12:53
+# Preprocessing Log — 2026-09-09 12:53
 
 ## Sanctions (gb_fcdo_sanctions)
 
@@ -340,6 +364,113 @@ FILE: docs/preprocessing_log.md
 
 
 ================================================
+FILE: docs/spot_check_sample.csv
+================================================
+﻿company_number,psc_name,nationality,psc_birth_year,psc_birth_month,list_name,list_source,list_birth_date,tier,score,stratum,stratum_size,kind,seed_source,rule_used,psc_row_id,list_entity_id,is_correct
+00854667,John Hemming,British,1960,3,John Hemming,pep,1960-03-16,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,419836,Q673430,
+02353266,Andrew Lloyd Webber,British,1948,3,Andrew Lloyd Webber,pep,1948-03-22,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,445113,Q180975,
+05579314,Gregory Stone,British,1946,12,Gregory Stone,pep,1946-12-12,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,63479,Q106813518,
+05707007,Michael Ashcroft,"Belizean,British",1946,3,Michael Ashcroft,pep,1946-03-04,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,461935,Q335530,
+06288117,David Edwards,British,1966,11,David Edwards,pep,1966-11-08,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,161347,Q107370050,
+07422301,John Stewart,British,1957,8,John Stewart,pep,1957-08-21,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,26925,Q107084907,
+07572901,Peter Caruana,British,1956,10,Peter Caruana,pep,1956-10-15,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,296866,Q249192,
+07984693,Paul Stephenson,British,1953,9,Paul Stephenson,pep,1953-09-26,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,283083,Q9057041,
+08042030,Peter Caruana,British,1956,10,Peter Caruana,pep,1956-10-15,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,286254,Q249192,
+08376306,Mark Pritchard,British,1966,11,Mark Pritchard,pep,1966-11-22,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,107328,Q575183,
+08415163,John Freeman,British,1951,3,John Freeman,pep,1951-03-25,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,66596,Q56808524,
+08840064,Andrew Lloyd Webber,British,1948,3,Andrew Lloyd Webber,pep,1948-03-22,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,299624,Q180975,
+08851435,Alison Harris,British,1965,7,Alison Harris,pep,1965-07-23,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,396606,Q24039903,
+08933913,Bernard Longley,British,1955,4,Bernard Longley,pep,1955-04-05,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,145801,Q793617,
+08955272,Alan Mak,British,1983,11,Alan Mak,pep,1983-11-19,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,89268,Q19868483,
+08976556,Stephen Smith,British,1960,6,Stephen Smith,pep,1960-06-30,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,392331,Q107369535,
+09012630,Paul Butler,British,1955,9,Paul Butler,pep,1955-09-18,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,156560,Q2059064,
+09044570,Peter Caruana,British,1956,10,Peter Caruana,pep,1956-10-15,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,405095,Q249192,
+09044611,Peter Caruana,British,1956,10,Peter Caruana,pep,1956-10-15,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,405094,Q249192,
+09132366,Alan Gemmell,British,1978,4,Alan Gemmell,pep,1978-04-06,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,17351,Q24703078,
+09442311,Libby Lane,British,1966,12,Libby Lane,pep,1966-12-08,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,402064,Q18643416,
+09643146,Gerard Sutcliffe,British,1953,5,Gerry Sutcliffe,pep,1953-05-13,strong,90.3,strong|pep,46,individual-person-with-significant-control,canonical,A,213693,Q328557,
+09966307,David Ward,British,1968,6,David Ward,pep,1968-06-11,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,110657,Q57313258,
+10277215,Jack Dromey,British,1948,9,Jack Dromey,pep,1948-09-29,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,237701,Q302244,
+10295296,Ahmad Hussain,British,1981,11,Ahmad Hussain,pep,1981-11-09,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,348091,Q18637467,
+10624425,Daniel Francis,British,1976,12,Daniel Francis,pep,1976-12,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,262815,Q109501223,
+10924611,Peter Caruana,British,1956,10,Peter Caruana,pep,1956-10-15,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,239312,Q249192,
+10924660,Peter Caruana,British,1956,10,Peter Caruana,pep,1956-10-15,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,340323,Q249192,
+10934384,George Hollingbery,British,1963,10,George Hollingbery,pep,1963-10-12,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,182104,Q689239,
+11226714,Ian Walker,British,1976,12,Iain Walker,pep,1976-12-06,strong,95.2,strong|pep,46,individual-person-with-significant-control,canonical,A,366706,Q57313244,
+11531410,Peter Caruana,British,1956,10,Peter Caruana,pep,1956-10-15,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,405071,Q249192,
+11531481,Peter Caruana,British,1956,10,Peter Caruana,pep,1956-10-15,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,405072,Q249192,
+11830753,John Wilson,British,1968,7,John Wilson,pep,1968-07-04,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,353802,Q21540295,
+12124227,Melanie Ward,Canadian,1981,2,Melanie Ward,pep,1981-02,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,262391,Q125028729,
+12203520,Peter Caruana,British,1956,10,Peter Caruana,pep,1956-10-15,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,240325,Q249192,
+12349340,Ian Austin,British,1965,3,Ian Austin,pep,1965-03-06,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,48108,Q259935,
+13242270,Shahid Malik,British,1967,11,Shahid Malik,pep,1967-11-24,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,445358,Q5973251,
+13550810,Mehmet Simsek,British,1967,1,Mehmet Şimşek,pep,1967-01-01,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,243468,Q945364,
+13551820,Luke Campbell,British,1987,9,Luke Campbell,pep,1987-09-27,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,244414,Q957135,
+13610871,Paul Scriven,British,1966,2,Paul Scriven,pep,1966-02-07,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,311785,Q7153504,
+SC064372,Nigel Griffiths,British,1955,5,Nigel Griffiths,pep,1955-05-20,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,184922,Q7032412,
+SC224191,Ian Murray,British,1976,8,Ian Murray,pep,1976-08-10,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,143285,Q578432,
+SC372765,Alan Brown,British,1970,8,Alan Brown,pep,1970-08-12,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,321891,Q19883288,
+SC447141,Caroline Wright,British,1959,8,Caroline Wright,pep,1959-08-10,strong,100.0,strong|pep,46,individual-person-with-significant-control,canonical,A,173786,Q105284788,
+01067991,Vladislav Vladimirovich Sviblov,Russian,1980,1,Vladislav Vladimirovich Sviblov,sanctions,1980-01-09,strong,100.0,strong|sanctions,6,individual-person-with-significant-control,alias,A,348181,Q110611694,
+04818143,Igor Vladimirovich Zyuzin,Russian,1960,5,Igor Vladimirovich ZYUZIN,sanctions,1960-05-29,strong,100.0,strong|sanctions,6,individual-person-with-significant-control,canonical,A,243163,Q4194951,
+04833150,Oleg Deripaska,Russian,1968,1,Oleg DERIPASKA,sanctions,1968-01-02,strong,100.0,strong|sanctions,6,individual-person-with-significant-control,canonical,A,228113,Q315514,
+05716547,Nord Gold Plc,,,,Nord Gold PLC,sanctions,,strong,100.0,strong|sanctions,6,corporate-entity-person-with-significant-control,canonical,B,466856,NK-kUFynAQLrnwv8xGnPRs8ZC,
+09083410,Murtaza Ali Lakhani,Canadian,1962,3,Murtaza Ali LAKHANI,sanctions,1962-03-08,strong,100.0,strong|sanctions,6,individual-person-with-significant-control,canonical,A,479192,NK-355Sbv9ZUXJLakBMDPJHk7,
+14919691,Abdul Rahman,British,1966,2,Abdul Rahman,sanctions,1966-02-02,strong,100.0,strong|sanctions,6,individual-person-with-significant-control,alias,A,52538,NK-kFyhR5rrzjLsExPBReQ3re,
+05167546,Andrew Booth,British,1957,8,Andrea Booth,pep,,weak,91.7,weak|pep|90-94.9,1191,individual-person-with-significant-control,canonical,A,336180,Q113572620,
+06528953,Mark Williams,British,1973,3,Mark Williams,pep,1966-03-24,weak,100.0,weak|pep|95+,3131,individual-person-with-significant-control,canonical,A,134359,Q266357,
+06836253,Mark Jones,British,1972,1,Mark Jones,pep,,weak,100.0,weak|pep|95+,3131,individual-person-with-significant-control,canonical,A,270124,Q91934623,
+07525834,Dinesh Patel,British,1967,5,Dinsha Patel,pep,1937-05-25,weak,91.7,weak|pep|90-94.9,1191,individual-person-with-significant-control,canonical,A,72312,Q5278713,
+07811530,David Taylor,British,1962,2,David Taylor,pep,1985,weak,100.0,weak|pep|95+,3131,individual-person-with-significant-control,canonical,A,70191,Q126937373,
+08023813,Patrick Sullivan,British,1977,4,Patricia Sullivan,pep,,weak,90.9,weak|pep|90-94.9,1191,individual-person-with-significant-control,canonical,A,253054,Q101413237,
+08764433,Dale Smith,British,1940,8,Alex Smith,pep,1943-12-02,weak,90.0,weak|pep|90-94.9,1191,individual-person-with-significant-control,canonical,A,28817,Q12720234,
+09134453,Conor Murphy,British,1991,10,Conor Murphy,pep,1963-07-10,weak,100.0,weak|pep|95+,3131,individual-person-with-significant-control,canonical,A,30785,Q578710,
+09311835,Gavin Robinson,British,1970,2,Gavin Robinson,pep,1984-11-22,weak,100.0,weak|pep|95+,3131,individual-person-with-significant-control,canonical,A,405345,Q5528262,
+10087282,Amjad Khan,Pakistani,1983,12,Amjid Khan,pep,,weak,90.0,weak|pep|90-94.9,1191,individual-person-with-significant-control,canonical,A,268699,Q118390892,
+10090953,Mohammad Iqbal,Pakistani,1973,2,Mohammed Iqbal,pep,,weak,92.9,weak|pep|90-94.9,1191,individual-person-with-significant-control,canonical,A,111088,Q55469195,
+10223511,Andrew Smith,British,1983,6,Drew Smith,pep,,weak,90.9,weak|pep|90-94.9,1191,individual-person-with-significant-control,canonical,A,223735,Q1258767,
+10275725,Michael Moore,Irish,1957,7,Michael Moore,pep,1965-06-03,weak,100.0,weak|pep|95+,3131,individual-person-with-significant-control,canonical,A,58394,Q333446,
+10332823,David Davies,British,1962,3,David Davies,pep,1970-06-01;1970-06-26;1970-07-27,weak,100.0,weak|pep|95+,3131,individual-person-with-significant-control,canonical,A,436672,Q296797,
+10829130,Richard Francis,British,1986,6,Francis Richards,pep,1945,weak,96.8,weak|pep|95+,3131,individual-person-with-significant-control,canonical,A,228161,Q711639,
+10884767,Richard Fletcher,British,1977,9,Richard Fletcher,pep,,weak,100.0,weak|pep|95+,3131,individual-person-with-significant-control,canonical,A,171288,Q118985304,
+11193335,Jack Jarvis,British,1993,12,Jackie Jarvis,pep,1968-09-14,weak,91.7,weak|pep|90-94.9,1191,individual-person-with-significant-control,canonical,A,400599,Q106616061,
+11659702,David William Moore,British,1965,1,David William Moore,pep,,weak,100.0,weak|pep|95+,3131,individual-person-with-significant-control,canonical,A,219633,Q135092522,
+12087056,Dylan Evans,Australian,1989,1,Dylan Evans,pep,,weak,100.0,weak|pep|95+,3131,individual-person-with-significant-control,canonical,A,285665,Q118523636,
+12096926,Joan Taylor,British,1947,5,John Taylor,pep,1937-12-24,weak,90.9,weak|pep|90-94.9,1191,individual-person-with-significant-control,canonical,A,317070,Q333991,
+13604380,Joan Doyle,British,1968,12,John Doyle,pep,1945-01-04,weak,90.0,weak|pep|90-94.9,1191,individual-person-with-significant-control,canonical,A,314730,Q6230056,
+NI639632,David Allen,British,1976,5,David Allen,pep,,weak,100.0,weak|pep|95+,3131,individual-person-with-significant-control,canonical,A,238837,Q125958275,
+SC263823,David Drew,British,1950,7,David Drew,pep,1952-04-13,weak,100.0,weak|pep|95+,3131,individual-person-with-significant-control,canonical,A,329378,Q728653,
+SC467986,Paul Kelly,British,1976,9,Paul Kelly,pep,,weak,100.0,weak|pep|95+,3131,individual-person-with-significant-control,canonical,A,145252,Q135033390,
+SC547261,Amjad Hussain,British,1952,2,Ahmad Hussain,pep,1981-11-09,weak,92.3,weak|pep|90-94.9,1191,individual-person-with-significant-control,canonical,A,105799,Q18637467,
+SC572006,Drew Murray,British,1992,7,Andrew Murray,pep,1947-01-29,weak,91.7,weak|pep|90-94.9,1191,individual-person-with-significant-control,canonical,A,231060,Q4758092,
+08052373,Sami Hasan,British,1971,3,Samir Hasan,sanctions,,weak,95.2,weak|sanctions|95+,293,individual-person-with-significant-control,alias,A,448840,NK-fuMkYCzaGYR8EXtjN9qRYV,
+08950573,Wei Zhang,British,1974,2,Wei Zhang,sanctions,1952-09-16,weak,100.0,weak|sanctions|95+,293,individual-person-with-significant-control,alias,A,294421,NK-VUaMZz8CegpjGRzKFidoLy,
+09364674,Zafar Iqbal,Pakistani,1987,8,ZAFAR IQBAL,sanctions,1953-10-04,weak,100.0,weak|sanctions|95+,293,individual-person-with-significant-control,canonical,A,297622,Q43388596,
+09696431,Abid Khan,Pakistani,1981,4,Abid KHAN,sanctions,1982,weak,100.0,weak|sanctions|95+,293,individual-person-with-significant-control,alias,A,95074,NK-kAAZX6HaWssud4HWqhuhiD,
+10490100,Shahid Ahmed,British,1987,3,AHMED SHAH,sanctions,1981;1985-01-01,weak,90.9,weak|sanctions|90-94.9,230,individual-person-with-significant-control,alias,A,34434,NK-WotgsdUqSFHsQxrUipQ3RZ,
+10635084,Mohamed Salem,British,1985,7,Mohamed Salem,sanctions,1981,weak,100.0,weak|sanctions|95+,293,individual-person-with-significant-control,alias,A,331905,Q8058697,
+10831142,Nazir Ahmad,British,1965,10,Nazim AHMAD,sanctions,1965-01-05,weak,90.9,weak|sanctions|90-94.9,230,individual-person-with-significant-control,alias,A,44642,NK-Zyiui4dU6xgisrPHdgDeWy,
+10840421,Shahid Ahmed,Bangladeshi,1966,12,AHMED SHAH,sanctions,1981;1985-01-01,weak,90.9,weak|sanctions|90-94.9,230,individual-person-with-significant-control,alias,A,166246,NK-WotgsdUqSFHsQxrUipQ3RZ,
+10851701,Abid Khan,British,1981,10,Abid KHAN,sanctions,1982,weak,100.0,weak|sanctions|95+,293,individual-person-with-significant-control,alias,A,184369,NK-kAAZX6HaWssud4HWqhuhiD,
+11296884,Arfan Ahmed,British,1977,3,Ahmed Kafan,sanctions,,weak,90.9,weak|sanctions|90-94.9,230,individual-person-with-significant-control,alias,A,360677,NK-QS5gzc5gwTXFLYK5YcNwiU,
+11656362,Samir Hassan,British,1989,4,Samir Hassan,sanctions,,weak,100.0,weak|sanctions|95+,293,individual-person-with-significant-control,alias,A,194855,NK-fuMkYCzaGYR8EXtjN9qRYV,
+11680413,Saleem Ahmed,British,1974,6,Ahmed SALEM,sanctions,1948-02-01,weak,95.7,weak|sanctions|95+,293,individual-person-with-significant-control,alias,A,405910,NK-aVMuxiZUWpCm3HoTG6PZ7A,
+11836547,Abdul Rahman,Pakistani,1985,2,Abdur Rahman,sanctions,1965-10-03,weak,91.7,weak|sanctions|90-94.9,230,individual-person-with-significant-control,alias,A,300853,NK-WuX9jdaAREQnYKtF89FB5S,
+12219894,Adam Khan,British,1999,10,Adam Khan,sanctions,1970;1971;1972;1973;1974;1975,weak,100.0,weak|sanctions|95+,293,individual-person-with-significant-control,alias,A,27572,NK-jdVwmWmTN9SHMCTwKpehsH,
+12264084,Abdur Rahman,British,1984,5,Abdul Rahman,sanctions,1990-03-03,weak,91.7,weak|sanctions|90-94.9,230,individual-person-with-significant-control,alias,A,28033,NK-Dj5FWSnnE7uHn7okya5VPq,
+13192531,Akbar Ahmed Ali,British,1985,9,Ali Akbar AHMEDIAN,sanctions,1961,weak,90.9,weak|sanctions|90-94.9,230,individual-person-with-significant-control,alias,A,454087,Q80927133,
+13199161,Ahmar Shah,British,1972,8,Ahmad SHAH,sanctions,1981;1985-01-01,weak,90.0,weak|sanctions|90-94.9,230,individual-person-with-significant-control,alias,A,483175,NK-WotgsdUqSFHsQxrUipQ3RZ,
+13515230,Abdul Rehman,Pakistani,1989,9,Abdul Rehman,sanctions,1965-10-03,weak,100.0,weak|sanctions|95+,293,individual-person-with-significant-control,alias,A,245249,NK-WuX9jdaAREQnYKtF89FB5S,
+13630740,Fasal Abbas,British,1978,8,Faysal Abbas,sanctions,1955,weak,95.7,weak|sanctions|95+,293,individual-person-with-significant-control,canonical,A,261425,Q5439107,
+14341495,Abul Hassan,British,1995,5,al-Hassan,sanctions,1963,weak,90.0,weak|sanctions|90-94.9,230,individual-person-with-significant-control,alias,A,40440,NK-edb4QpwXo3iRpmZggFKAYS,
+15063705,Ali Malik,British,1950,12,Malik Ali,sanctions,1956,weak,100.0,weak|sanctions|95+,293,individual-person-with-significant-control,alias,A,474187,Q128123195,
+15084435,Ansar Ali,British,1995,7,Ali Ansari,sanctions,1968-12-26,weak,94.7,weak|sanctions|90-94.9,230,individual-person-with-significant-control,alias,A,442830,NK-HQCiUW9iMXrPCKVMQx5SKh,
+15093885,Haider Ali,Pakistani,2003,10,Ali Haidar,sanctions,1962,weak,90.0,weak|sanctions|90-94.9,230,individual-person-with-significant-control,canonical,A,486434,Q2646694,
+15121825,Muhammad Ahmad,British,1979,6,Muhammad al-Ahmad,sanctions,1961,weak,90.3,weak|sanctions|90-94.9,230,individual-person-with-significant-control,alias,A,445416,Q60575926,
+
+
+
+================================================
 FILE: scripts/run_pipeline.py
 ================================================
 """
@@ -356,6 +487,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+import graph_builder  # noqa: E402
 import matching  # noqa: E402
 
 
@@ -365,6 +497,15 @@ def main():
     for k, v in match_counts.items():
         print(f"  {k}: {v}")
     print(f"  -> {matching.MATCHES_OUTPUT}")
+
+    print("\n=== Phase 2: Ownership graph ===")
+    stats = graph_builder.run()
+    for k, v in stats.items():
+        if k != "unmapped":
+            print(f"  {k}: {v}")
+    print(f"  unmapped strong matches: {len(stats['unmapped'])}")
+    print(f"  -> {graph_builder.GRAPH_OUTPUT}")
+    print(f"  -> {graph_builder.STATS_OUTPUT}")
 
 
 if __name__ == "__main__":
@@ -413,7 +554,7 @@ def main():
     os.makedirs(DOCS, exist_ok=True)
 
     log_lines = [
-        f"# Preprocessing Log â€” {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"# Preprocessing Log — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         "",
     ]
 
@@ -452,6 +593,388 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+================================================
+FILE: src/graph_builder.py
+================================================
+"""
+Phase 2: build the ownership graph (docs/implementation_plan.md).
+
+Turns PSC rows into a directed graph of who controls what:
+
+Nodes
+    company:<company_number>            one per company
+    person:<normalized_name>|<postcode> individual PSCs. The same name at the
+                                        same postcode is merged into one node
+                                        across all the companies it controls.
+                                        No postcode -> normalised full address.
+    corp:<normalized_name>              corporate PSCs. legal-person PSCs
+                                        (e.g. government bodies; skipped in
+                                        matching) are also corp nodes, so a
+                                        company's degree counts all its PSCs.
+Edges
+    PSC node -> company node, with natures_of_control and the psc_row_ids
+    behind the edge. A PSC listed more than once for the same company becomes
+    one edge (natures of control merged).
+Flags
+    Strong matches from data/processed/matches.csv are mapped to nodes through
+    psc_row_id: flagged=True and flag_source = pep / sanctions / both.
+    Weak matches are kept separately in weak_flagged / weak_flag_source.
+    Each match is checked against the PSC row it points at (same company
+    number and name), so a matches.csv that is stale relative to
+    psc_clean.csv is reported instead of silently flagging the wrong node.
+Address key
+    Per PSC row: postcode + first address line, lowercased with spaces
+    collapsed (normalised full address if there is no postcode). Stored on
+    edges and on PSC nodes (most common key across the node's rows). No
+    address nodes are added to the graph.
+
+Outputs: data/processed/graph.pkl (pickle; write_gpickle is gone in
+networkx 3), data/processed/nodes.csv, data/processed/edges.csv, and the
+Checkpoint 2 summary docs/graph_stats.md.
+
+Run directly:
+    python src/graph_builder.py
+"""
+
+import argparse
+import os
+import pickle
+import re
+import sys
+from datetime import date
+
+import networkx as nx
+import pandas as pd
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+INTERIM = os.path.join(ROOT, "data", "interim")
+PROCESSED = os.path.join(ROOT, "data", "processed")
+
+PSC_INPUT = os.path.join(INTERIM, "psc_clean.csv")
+MATCHES_INPUT = os.path.join(PROCESSED, "matches.csv")
+GRAPH_OUTPUT = os.path.join(PROCESSED, "graph.pkl")
+NODES_OUTPUT = os.path.join(PROCESSED, "nodes.csv")
+EDGES_OUTPUT = os.path.join(PROCESSED, "edges.csv")
+STATS_OUTPUT = os.path.join(ROOT, "docs", "graph_stats.md")
+
+PSC_COLS = ["company_number", "kind", "name", "normalized_name", "address",
+            "natures_of_control"]
+
+NODE_FIELDS = ["node_id", "node_type", "name", "kind", "postcode", "address_key",
+               "n_psc_rows", "flagged", "flag_source", "weak_flagged", "weak_flag_source"]
+EDGE_FIELDS = ["source", "target", "natures_of_control", "address_key", "psc_row_ids"]
+
+# UK postcode: outward code (A9, A99, A9A, AA9, AA99, AA9A) + inward code (9AA).
+_POSTCODE_RE = re.compile(r"\b([A-Z]{1,2}\d[A-Z\d]?)\s*(\d[A-Z]{2})\b", re.IGNORECASE)
+# A first segment that is only a house number, e.g. "3" in "3, Vicarage Crescent".
+_HOUSE_NUMBER_RE = re.compile(r"^\d+[a-z]?(-\d+[a-z]?)?$", re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Address and node-ID helpers (unit-tested)
+# ---------------------------------------------------------------------------
+
+def extract_postcode(address: str) -> str:
+    """Last UK postcode in the address, as 'GL51 0TJ'; '' if none."""
+    found = _POSTCODE_RE.findall(address or "")
+    if not found:
+        return ""
+    outward, inward = found[-1]
+    return f"{outward.upper()} {inward.upper()}"
+
+
+def normalize_address(address: str) -> str:
+    return " ".join((address or "").lower().split())
+
+
+def first_address_line(address: str) -> str:
+    """First comma segment; a bare house number is joined to the street."""
+    parts = [p.strip() for p in (address or "").split(",") if p.strip()]
+    if not parts:
+        return ""
+    if _HOUSE_NUMBER_RE.match(parts[0]) and len(parts) > 1:
+        return f"{parts[0]} {parts[1]}"
+    return parts[0]
+
+
+def address_key(address: str) -> str:
+    postcode = extract_postcode(address)
+    if postcode:
+        return normalize_address(f"{postcode} | {first_address_line(address)}")
+    return normalize_address(address)
+
+
+def company_node_id(company_number: str) -> str:
+    return f"company:{company_number}"
+
+
+def psc_node_id(kind: str, normalized_name: str, address: str) -> str:
+    if kind.startswith("individual"):
+        where = extract_postcode(address) or normalize_address(address)
+        return f"person:{normalized_name}|{where}"
+    return f"corp:{normalized_name}"
+
+
+def _psc_node_type(kind: str) -> str:
+    return "person" if kind.startswith("individual") else "corp"
+
+
+def _source_label(sources) -> str:
+    sources = set(sources)
+    if not sources:
+        return ""
+    return "both" if len(sources) > 1 else sources.pop()
+
+
+# ---------------------------------------------------------------------------
+# Graph construction
+# ---------------------------------------------------------------------------
+
+def _merge_natures(values) -> str:
+    return ";".join(sorted({n for v in values for n in v.split(";") if n}))
+
+
+def _edges_frame(psc: pd.DataFrame) -> pd.DataFrame:
+    """One row per (PSC node, company node); duplicates merged."""
+    keys = ["psc_node", "company_node"]
+    dup = psc.duplicated(keys, keep=False)
+    single = psc.loc[~dup, keys + ["natures_of_control", "address_key", "psc_row_id"]].copy()
+    single["psc_row_ids"] = single.pop("psc_row_id").astype(str)
+    merged = (
+        psc.loc[dup]
+        .groupby(keys, sort=False)
+        .agg(natures_of_control=("natures_of_control", _merge_natures),
+             address_key=("address_key", "first"),
+             psc_row_ids=("psc_row_id", lambda s: ";".join(map(str, s))))
+        .reset_index()
+    )
+    edges = pd.concat([single, merged], ignore_index=True)
+    return edges.rename(columns={"psc_node": "source", "company_node": "target"})[EDGE_FIELDS]
+
+
+def _psc_nodes_frame(psc: pd.DataFrame) -> pd.DataFrame:
+    first = psc.drop_duplicates("psc_node").set_index("psc_node")
+    common_key = (psc.groupby(["psc_node", "address_key"]).size()
+                  .reset_index(name="n")
+                  .sort_values(["psc_node", "n"], ascending=[True, False])
+                  .drop_duplicates("psc_node")
+                  .set_index("psc_node")["address_key"])
+    nodes = pd.DataFrame({
+        "node_id": first.index,
+        "node_type": first["kind"].map(_psc_node_type).values,
+        "name": first["name"].values,
+        "kind": first["kind"].values,
+        "postcode": first["address"].map(extract_postcode).values,
+        "address_key": common_key.reindex(first.index).values,
+        "n_psc_rows": psc["psc_node"].value_counts().reindex(first.index).values,
+    })
+    nodes.loc[nodes["node_type"] == "corp", "postcode"] = ""
+    return nodes
+
+
+def _map_flags(psc: pd.DataFrame, matches: pd.DataFrame):
+    """
+    Returns (flags DataFrame indexed by psc node, unmapped strong matches).
+    A match is mapped only if its psc_row_id exists and the PSC row there has
+    the same company number and name as the match.
+    """
+    rows = psc.set_index("psc_row_id")[["company_number", "name", "psc_node"]]
+    m = matches.join(rows, on="psc_row_id", rsuffix="_psc")
+    ok = (m["psc_node"].notna()
+          & (m["company_number"] == m["company_number_psc"])
+          & (m["psc_name"] == m["name"]))
+    unmapped = m.loc[~ok & (m["tier"] == "strong"),
+                     ["psc_row_id", "company_number", "psc_name", "list_source", "list_name"]]
+    m = m[ok]
+
+    def per_node(tier):
+        sub = m[m["tier"] == tier]
+        return sub.groupby("psc_node")["list_source"].agg(_source_label)
+
+    flags = pd.DataFrame({"flag_source": per_node("strong"),
+                          "weak_flag_source": per_node("weak")}).fillna("")
+    flags["flagged"] = flags["flag_source"] != ""
+    flags["weak_flagged"] = flags["weak_flag_source"] != ""
+    return flags, unmapped.reset_index(drop=True)
+
+
+def build_graph(psc: pd.DataFrame, matches: pd.DataFrame):
+    """
+    psc: PSC rows with psc_row_id + PSC_COLS. matches: Phase 1 output.
+    Returns (graph, nodes DataFrame, edges DataFrame, unmapped strong matches).
+    """
+    psc = psc[psc["normalized_name"] != ""].copy()
+    psc["psc_node"] = [psc_node_id(k, n, a) for k, n, a in
+                       zip(psc["kind"], psc["normalized_name"], psc["address"])]
+    psc["company_node"] = psc["company_number"].map(company_node_id)
+    psc["address_key"] = psc["address"].map(address_key)
+
+    edges = _edges_frame(psc)
+
+    companies = pd.DataFrame({"node_id": psc["company_node"].unique()})
+    companies["node_type"] = "company"
+    companies["name"] = companies["node_id"].str.removeprefix("company:")
+    nodes = pd.concat([companies, _psc_nodes_frame(psc)], ignore_index=True)
+
+    flags, unmapped = _map_flags(psc, matches)
+    nodes = nodes.join(flags, on="node_id")
+    for col in ("flag_source", "weak_flag_source", "kind", "postcode", "address_key"):
+        nodes[col] = nodes[col].fillna("")
+    for col in ("flagged", "weak_flagged"):
+        nodes[col] = nodes[col].fillna(False).astype(bool)
+    nodes["n_psc_rows"] = nodes["n_psc_rows"].fillna(0).astype(int)
+    nodes = nodes[NODE_FIELDS]
+
+    graph = nx.DiGraph()
+    graph.add_nodes_from(
+        (r["node_id"], {k: r[k] for k in NODE_FIELDS if k != "node_id"})
+        for r in nodes.to_dict("records")
+    )
+    graph.add_edges_from(
+        (r["source"], r["target"], {k: r[k] for k in EDGE_FIELDS[2:]})
+        for r in edges.to_dict("records")
+    )
+    return graph, nodes, edges, unmapped
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint 2 summary
+# ---------------------------------------------------------------------------
+
+def graph_stats(graph: nx.DiGraph, nodes: pd.DataFrame, n_strong: int,
+                unmapped: pd.DataFrame) -> dict:
+    sizes = sorted((len(c) for c in nx.weakly_connected_components(graph)), reverse=True)
+    sizes_s = pd.Series(sizes)
+    psc_nodes = nodes[nodes["node_type"] != "company"]
+    people = nodes[nodes["node_type"] == "person"]
+    return {
+        "nodes_by_type": nodes["node_type"].value_counts().to_dict(),
+        "n_nodes": graph.number_of_nodes(),
+        "n_edges": graph.number_of_edges(),
+        "n_components": len(sizes),
+        "size_min": int(sizes_s.min()),
+        "size_median": float(sizes_s.median()),
+        "size_max": int(sizes_s.max()),
+        "top10_sizes": sizes[:10],
+        "size_counts": sizes_s.value_counts().sort_index().head(6).to_dict(),
+        "people_multi_company": sum(graph.out_degree(n) >= 2 for n in people["node_id"]),
+        "people_without_postcode": int((people["postcode"] == "").sum()),
+        "flagged_nodes": int(psc_nodes["flagged"].sum()),
+        "flagged_by_source": psc_nodes.loc[psc_nodes["flagged"], "flag_source"].value_counts().to_dict(),
+        "weak_flagged_nodes": int(psc_nodes["weak_flagged"].sum()),
+        "n_strong_matches": n_strong,
+        "unmapped": unmapped,
+    }
+
+
+def write_stats(stats: dict, path: str = STATS_OUTPUT):
+    by_type = stats["nodes_by_type"]
+    unmapped = stats["unmapped"]
+    lines = [
+        "# Graph statistics (Phase 2, Checkpoint 2)",
+        "",
+        f"Generated {date.today().isoformat()} by `src/graph_builder.py` from "
+        "`data/interim/psc_clean.csv` and `data/processed/matches.csv`.",
+        "",
+        "## Size",
+        "",
+        "| Node type | Count |",
+        "|---|---|",
+        *[f"| {t} | {by_type.get(t, 0):,} |" for t in ("company", "person", "corp")],
+        f"| **total nodes** | **{stats['n_nodes']:,}** |",
+        f"| **edges** (PSC -> company) | **{stats['n_edges']:,}** |",
+        "",
+        f"- People who control 2+ companies (merged by name + postcode): "
+        f"{stats['people_multi_company']:,}",
+        f"- Person nodes with no postcode (keyed by full address instead): "
+        f"{stats['people_without_postcode']:,}",
+        "",
+        "## Connected components (weakly connected)",
+        "",
+        f"- Number of components: {stats['n_components']:,}",
+        f"- Size (nodes): min {stats['size_min']}, median {stats['size_median']:g}, "
+        f"max {stats['size_max']:,}",
+        f"- Top 10 sizes: {', '.join(f'{s:,}' for s in stats['top10_sizes'])}",
+        "- Components by size (smallest sizes): "
+        + ", ".join(f"{k} nodes: {v:,}" for k, v in stats["size_counts"].items()),
+        "",
+        "## Flags",
+        "",
+        f"- Strongly flagged PSC nodes: {stats['flagged_nodes']} "
+        f"({', '.join(f'{k}: {v}' for k, v in stats['flagged_by_source'].items()) or 'none'})",
+        f"- Weakly flagged PSC nodes: {stats['weak_flagged_nodes']:,}",
+        "",
+        "## Strong-match mapping check",
+        "",
+    ]
+    if unmapped.empty:
+        lines.append(f"All {stats['n_strong_matches']} strong matches were mapped to a node.")
+    else:
+        lines += [
+            f"**{len(unmapped)} of {stats['n_strong_matches']} strong matches were NOT "
+            "mapped** (psc_row_id missing, or company/name differ from psc_clean.csv -- "
+            "rerun Phase 1 if the PSC file changed):",
+            "",
+            "| psc_row_id | company_number | psc_name | list_source | list_name |",
+            "|---|---|---|---|---|",
+            *[f"| {r.psc_row_id} | {r.company_number} | {r.psc_name} | {r.list_source} "
+              f"| {r.list_name} |" for r in unmapped.itertuples()],
+        ]
+    lines.append("")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# File I/O
+# ---------------------------------------------------------------------------
+
+def load_psc(path: str = PSC_INPUT) -> pd.DataFrame:
+    psc = pd.read_csv(path, dtype=str, keep_default_na=False, usecols=PSC_COLS)
+    psc.insert(0, "psc_row_id", range(len(psc)))  # same row positions as Phase 1
+    return psc
+
+
+def load_matches(path: str = MATCHES_INPUT) -> pd.DataFrame:
+    m = pd.read_csv(path, dtype=str, keep_default_na=False)
+    m["psc_row_id"] = m["psc_row_id"].astype(int)
+    return m
+
+
+def run(psc_path=PSC_INPUT, matches_path=MATCHES_INPUT, graph_path=GRAPH_OUTPUT,
+        nodes_path=NODES_OUTPUT, edges_path=EDGES_OUTPUT, stats_path=STATS_OUTPUT):
+    psc = load_psc(psc_path)
+    matches = load_matches(matches_path)
+    graph, nodes, edges, unmapped = build_graph(psc, matches)
+
+    os.makedirs(os.path.dirname(graph_path), exist_ok=True)
+    with open(graph_path, "wb") as f:
+        pickle.dump(graph, f, protocol=pickle.HIGHEST_PROTOCOL)
+    nodes.to_csv(nodes_path, index=False)
+    edges.to_csv(edges_path, index=False)
+
+    stats = graph_stats(graph, nodes, int((matches["tier"] == "strong").sum()), unmapped)
+    write_stats(stats, stats_path)
+    return stats
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--psc", default=PSC_INPUT)
+    ap.add_argument("--matches", default=MATCHES_INPUT)
+    args = ap.parse_args()
+
+    result = run(args.psc, args.matches)
+    for k, v in result.items():
+        if k != "unmapped":
+            print(f"  {k}: {v}", file=sys.stderr)
+    print(f"  unmapped strong matches: {len(result['unmapped'])}", file=sys.stderr)
+    print(f"Graph written to: {GRAPH_OUTPUT}", file=sys.stderr)
+    print(f"Stats written to: {STATS_OUTPUT}", file=sys.stderr)
 
 
 
@@ -643,7 +1166,7 @@ def detect_mode(psc_columns, list_columns) -> str:
     return "B"
 
 
-_APOSTROPHE_RE = re.compile(r"['â€™`]")
+_APOSTROPHE_RE = re.compile(r"['’`]")
 
 
 def person_word_count(raw_name: str) -> int:
@@ -898,7 +1421,84 @@ if __name__ == "__main__":
 ================================================
 FILE: src/name_normalization.py
 ================================================
-Error reading file with 'cp1252': 'charmap' codec can't decode byte 0x81 in position 1166: character maps to <undefined>
+"""
+Name normalization pipeline (Charter Section 2.2 / Module 4 fix).
+
+Pipeline order, matching the charter exactly:
+    lowercase -> strip punctuation -> extract legal-suffix tokens into a
+    separate flag (not deleted) -> tokenize -> light stemming.
+
+This runs BEFORE rapidfuzz scoring, as a distinct step -- not folded into
+the matching call -- so it's demonstrable as its own text-analytics
+component rather than a fuzzy-matching black box.
+"""
+
+import re
+import unicodedata
+
+try:
+    from unidecode import unidecode
+    _HAS_UNIDECODE = True
+except ImportError:
+    _HAS_UNIDECODE = False
+
+LEGAL_SUFFIXES = {
+    "ltd", "limited", "llp", "llc", "plc", "inc", "trust",
+    "holdings", "co", "company", "corp", "corporation",
+}
+
+# Very light stemming: strip a small set of common trailing inflections.
+# Deliberately conservative -- aggressive stemming on proper names causes
+# more false merges than it prevents false misses.
+_STEM_SUFFIXES = ("'s",)
+
+
+def _strip_accents(text: str) -> str:
+    """
+    Transliterate to ASCII so matching isn't defeated by script differences --
+    both accented Latin ('Câmpean' -> 'Campean') and non-Latin scripts
+    ('Костенко' -> 'Kostenko'), per the transliteration step in the Final
+    Scope Summary. Uses unidecode if installed (handles Cyrillic, Greek,
+    etc. properly); falls back to NFKD diacritic-stripping, which only
+    handles accented Latin and leaves other scripts unchanged, if not.
+    """
+    if _HAS_UNIDECODE:
+        return unidecode(text)
+    normalized = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in normalized if not unicodedata.combining(c))
+
+
+def _light_stem(token: str) -> str:
+    for suf in _STEM_SUFFIXES:
+        if token.endswith(suf):
+            return token[: -len(suf)]
+    return token
+
+
+def normalize_name(raw_name: str) -> dict:
+    """
+    Returns a dict with:
+        normalized   -- the cleaned, space-joined token string used for matching
+        tokens       -- list of tokens (legal suffixes removed)
+        has_legal_suffix -- bool flag, the extracted information (not discarded)
+    """
+    if not raw_name or not raw_name.strip():
+        return {"normalized": "", "tokens": [], "has_legal_suffix": False}
+
+    text = _strip_accents(raw_name)
+    text = text.lower()
+    text = re.sub(r"[^\w\s]", " ", text)  # strip punctuation
+    raw_tokens = text.split()
+
+    has_legal_suffix = any(t in LEGAL_SUFFIXES for t in raw_tokens)
+    tokens = [_light_stem(t) for t in raw_tokens if t not in LEGAL_SUFFIXES]
+
+    return {
+        "normalized": " ".join(tokens).strip(),
+        "tokens": tokens,
+        "has_legal_suffix": has_legal_suffix,
+    }
+
 
 
 ================================================
@@ -1027,7 +1627,7 @@ FILE: src/psc_loader.py
 Companies House PSC snapshot loader.
 
 Reads whatever .txt (JSONL) parts are actually present in the snapshot
-directory -- currently just part 1 of 32 -- and logs coverage explicitly so
+directory (or a single .txt file) and logs coverage explicitly so
 match-count results are never silently treated as full-register figures.
 
 Handles both PSC record kinds seen in the snapshot:
@@ -1035,11 +1635,15 @@ Handles both PSC record kinds seen in the snapshot:
       or identity_verification_details.preferred_name if present.
     - corporate-entity-person-with-significant-control: name field directly.
 
+Also keeps birth_month / birth_year (individuals only; Companies House
+publishes month + year, never the full date). These enable Mode A
+(birth-date) strong matching in src/matching.py.
+
 Streams line-by-line (snapshot parts can be large) rather than loading the
 whole file into memory, and writes output incrementally.
 
 Run directly:
-    python src/psc_loader.py --input-dir data/raw/psc/psc_snapshot_2026-08-02 \
+    python src/psc_loader.py --input-dir data/raw/psc \
                               --output data/interim/psc_clean.csv \
                               --expected-parts 32
 """
@@ -1057,7 +1661,7 @@ from name_normalization import normalize_name
 OUTPUT_FIELDS = [
     "company_number", "kind", "name", "normalized_name", "has_legal_suffix",
     "address", "nationality", "country_of_residence", "notified_on",
-    "natures_of_control", "source_part",
+    "natures_of_control", "source_part", "birth_month", "birth_year",
 ]
 
 
@@ -1106,6 +1710,9 @@ def iter_psc_records(part_path: str, part_label: str):
                 continue
 
             norm = normalize_name(name)
+            # Companies House publishes only month + year of birth, and only
+            # for individual PSCs. Corporate PSCs have no date_of_birth.
+            dob = data.get("date_of_birth") or {}
             yield {
                 "company_number": rec.get("company_number", ""),
                 "kind": data.get("kind", ""),
@@ -1118,11 +1725,16 @@ def iter_psc_records(part_path: str, part_label: str):
                 "notified_on": data.get("notified_on", ""),
                 "natures_of_control": ";".join(data.get("natures_of_control", []) or []),
                 "source_part": part_label,
+                "birth_month": dob.get("month", ""),
+                "birth_year": dob.get("year", ""),
             }
 
 
 def run(input_dir: str, output_path: str, expected_parts: int = 32):
-    part_files = sorted(glob.glob(os.path.join(input_dir, "*.txt")))
+    if os.path.isfile(input_dir):
+        part_files = [input_dir]
+    else:
+        part_files = sorted(glob.glob(os.path.join(input_dir, "*.txt")))
 
     if not part_files:
         raise FileNotFoundError(f"No .txt parts found in {input_dir}")
@@ -1136,7 +1748,12 @@ def run(input_dir: str, output_path: str, expected_parts: int = 32):
             file=sys.stderr,
         )
 
-    counts = {"parts_processed": 0, "records_written": 0, "records_skipped_no_name": 0}
+    counts = {
+        "parts_processed": 0,
+        "records_written": 0,
+        "records_skipped_no_name": 0,
+        "records_with_birth_year": 0,
+    }
 
     with open(output_path, "w", encoding="utf-8", newline="") as out_f:
         writer = csv.DictWriter(out_f, fieldnames=OUTPUT_FIELDS)
@@ -1149,6 +1766,8 @@ def run(input_dir: str, output_path: str, expected_parts: int = 32):
             for record in iter_psc_records(part_path, part_label):
                 writer.writerow(record)
                 part_record_count += 1
+                if record["birth_year"] != "":
+                    counts["records_with_birth_year"] += 1
             counts["records_written"] += part_record_count
             counts["parts_processed"] += 1
             print(f"    -> {part_record_count} named PSC records", file=sys.stderr)
@@ -1160,7 +1779,8 @@ def run(input_dir: str, output_path: str, expected_parts: int = 32):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input-dir", required=True, help="Directory containing PSC snapshot .txt parts")
+    ap.add_argument("--input-dir", required=True,
+                    help="Directory containing PSC snapshot .txt parts, or a single .txt file")
     ap.add_argument("--output", required=True)
     ap.add_argument("--expected-parts", type=int, default=32)
     args = ap.parse_args()
@@ -1171,7 +1791,6 @@ if __name__ == "__main__":
     for k, v in result_counts.items():
         print(f"  {k}: {v}", file=sys.stderr)
     print(f"Cleaned file written to: {args.output}", file=sys.stderr)
-
 
 
 ================================================
@@ -1191,8 +1810,13 @@ Each row's name AND each semicolon-separated alias becomes its own seed row,
 tagged by source, so a match against an alias is distinguishable from a
 match against the canonical name during the manual spot-check.
 
+Also keeps birth_date (raw, ';'-separated, may be full dates or year-only),
+addresses and identifiers from the source row, repeated on every seed row of
+that entity. birth_date enables Mode A (birth-date) strong matching in
+src/matching.py.
+
 Run directly:
-    python src/sanctions_loader.py --input data/raw/fcdo_sanctions/gb_fcdo_sanctions_2026-08-02.csv \
+    python src/sanctions_loader.py --input data/raw/fcdo_sanctions/fcdo.csv \
                                     --output data/interim/sanctions_clean.csv
 """
 
@@ -1206,7 +1830,21 @@ from name_normalization import normalize_name
 OUTPUT_FIELDS = [
     "source_id", "schema", "seed_name", "seed_source", "normalized_name",
     "has_legal_suffix", "countries", "dataset",
+    "birth_date", "addresses", "identifiers",
 ]
+
+
+def _entity_fields(row: dict) -> dict:
+    """Fields shared by every seed row (canonical + aliases) of one entity."""
+    return {
+        "source_id": row.get("id", ""),
+        "schema": row.get("schema", ""),
+        "countries": row.get("countries", ""),
+        "dataset": row.get("dataset", ""),
+        "birth_date": (row.get("birth_date") or "").strip(),
+        "addresses": fix_mojibake((row.get("addresses") or "").strip()),
+        "identifiers": (row.get("identifiers") or "").strip(),
+    }
 
 
 def expand_rows(input_path: str):
@@ -1214,18 +1852,17 @@ def expand_rows(input_path: str):
     with open(input_path, encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            shared = _entity_fields(row)
+
             name = fix_mojibake((row.get("name") or "").strip())
             if name:
                 norm = normalize_name(name)
                 yield {
-                    "source_id": row.get("id", ""),
-                    "schema": row.get("schema", ""),
+                    **shared,
                     "seed_name": name,
                     "seed_source": "sanctions_canonical",
                     "normalized_name": norm["normalized"],
                     "has_legal_suffix": norm["has_legal_suffix"],
-                    "countries": row.get("countries", ""),
-                    "dataset": row.get("dataset", ""),
                 }
 
             for alias in (row.get("aliases") or "").split(";"):
@@ -1236,19 +1873,22 @@ def expand_rows(input_path: str):
                 if not norm["normalized"]:
                     continue
                 yield {
-                    "source_id": row.get("id", ""),
-                    "schema": row.get("schema", ""),
+                    **shared,
                     "seed_name": alias,
                     "seed_source": "sanctions_alias",
                     "normalized_name": norm["normalized"],
                     "has_legal_suffix": norm["has_legal_suffix"],
-                    "countries": row.get("countries", ""),
-                    "dataset": row.get("dataset", ""),
                 }
 
 
 def run(input_path: str, output_path: str):
-    counts = {"canonical_names": 0, "aliases": 0, "total_seed_rows": 0}
+    counts = {
+        "canonical_names": 0,
+        "aliases": 0,
+        "total_seed_rows": 0,
+        "rows_with_birth_date": 0,
+        "rows_with_addresses": 0,
+    }
     rows_out = []
     for row in expand_rows(input_path):
         rows_out.append(row)
@@ -1257,6 +1897,10 @@ def run(input_path: str, output_path: str):
             counts["canonical_names"] += 1
         else:
             counts["aliases"] += 1
+        if row["birth_date"]:
+            counts["rows_with_birth_date"] += 1
+        if row["addresses"]:
+            counts["rows_with_addresses"] += 1
 
     with open(output_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS)
@@ -1280,6 +1924,273 @@ if __name__ == "__main__":
     print(f"Cleaned file written to: {args.output}", file=sys.stderr)
 
 
+================================================
+FILE: src/spot_check.py
+================================================
+"""
+Phase 1b: manual spot-check of name matches (docs/implementation_plan.md).
+
+Two commands:
+
+    python src/spot_check.py sample
+        Reads data/processed/matches.csv and writes docs/spot_check_sample.csv:
+        ALL strong matches (up to --n-strong, default 50 -> random if more) plus
+        --n-weak (default 50) weak matches stratified by score (90-94.9 and
+        95+, half each). Weak PEP rows dominate the population, so the weak
+        sample is also split across list_source. `is_correct` is left empty:
+        fill it by hand with y (same person/company), n (different) or ?
+        (cannot tell).
+
+    python src/spot_check.py score
+        Reads the filled-in file and writes docs/match_precision.md:
+        precision per tier and per list, with sample sizes. '?' and blank rows
+        are excluded from precision and reported separately. Weak precision
+        is also given as a population-weighted estimate, because the weak
+        sample is stratified, not uniform.
+
+To make hand-checking easier, the sample also shows the PSC birth year/month
+(psc_clean.csv) and the list entry's birth_date (pep_clean / sanctions_clean).
+random_state=42 throughout.
+"""
+
+import argparse
+import os
+import sys
+
+import pandas as pd
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+INTERIM = os.path.join(ROOT, "data", "interim")
+PROCESSED = os.path.join(ROOT, "data", "processed")
+DOCS = os.path.join(ROOT, "docs")
+
+MATCHES = os.path.join(PROCESSED, "matches.csv")
+PSC = os.path.join(INTERIM, "psc_clean.csv")
+PEP = os.path.join(INTERIM, "pep_clean.csv")
+SANCTIONS = os.path.join(INTERIM, "sanctions_clean.csv")
+SAMPLE = os.path.join(DOCS, "spot_check_sample.csv")
+PRECISION = os.path.join(DOCS, "match_precision.md")
+
+SEED = 42
+WEAK_SPLIT_SCORE = 95.0
+
+SAMPLE_COLS = [
+    "company_number", "psc_name", "nationality", "psc_birth_year", "psc_birth_month",
+    "list_name", "list_source", "list_birth_date", "tier", "score", "stratum",
+    "stratum_size", "kind", "seed_source", "rule_used", "psc_row_id",
+    "list_entity_id", "is_correct",
+]
+
+
+# ---------------------------------------------------------------------------
+# sample
+# ---------------------------------------------------------------------------
+
+def _take(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    return df if len(df) <= n else df.sample(n=n, random_state=SEED)
+
+
+def draw_sample(matches: pd.DataFrame, n_strong: int = 50, n_weak: int = 50) -> pd.DataFrame:
+    """Strong: all (or n_strong random). Weak: stratified by score band and list."""
+    m = matches.copy()
+    m["score"] = m["score"].astype(float)
+
+    strong = m[m["tier"] == "strong"].copy()
+    strong["stratum"] = "strong|" + strong["list_source"]
+    strong_pop = strong.groupby("stratum").size().to_dict()
+    strong_s = _take(strong, n_strong)
+
+    weak = m[m["tier"] == "weak"].copy()
+    band = (weak["score"] >= WEAK_SPLIT_SCORE).map({True: "95+", False: "90-94.9"})
+    weak["stratum"] = "weak|" + weak["list_source"] + "|" + band
+    weak_pop = weak.groupby("stratum").size().to_dict()
+
+    # Spread n_weak evenly over non-empty strata; leftovers go to larger strata.
+    strata = sorted(weak_pop)
+    parts = []
+    if strata:
+        quota = {s: min(weak_pop[s], n_weak // len(strata)) for s in strata}
+        spare = n_weak - sum(quota.values())
+        for s in sorted(strata, key=lambda k: -weak_pop[k]):
+            if spare <= 0:
+                break
+            add = min(spare, weak_pop[s] - quota[s])
+            quota[s] += add
+            spare -= add
+        for s in strata:
+            parts.append(_take(weak[weak["stratum"] == s], quota[s]))
+    weak_s = pd.concat(parts) if parts else weak.iloc[0:0]
+
+    out = pd.concat([strong_s, weak_s], ignore_index=True)
+    pops = {**strong_pop, **weak_pop}
+    out["stratum_size"] = out["stratum"].map(pops)
+    out["is_correct"] = ""
+    return out
+
+
+def _attach_context(sample: pd.DataFrame, psc_path=PSC, pep_path=PEP,
+                    sanctions_path=SANCTIONS) -> pd.DataFrame:
+    """Add PSC birth year/month and list birth_date as read-only helper columns."""
+    sample = sample.copy()
+    sample["psc_birth_year"] = ""
+    sample["psc_birth_month"] = ""
+    sample["list_birth_date"] = ""
+
+    if os.path.exists(psc_path):
+        header = pd.read_csv(psc_path, nrows=0).columns
+        cols = [c for c in ("birth_year", "birth_month") if c in header]
+        if cols:
+            psc = pd.read_csv(psc_path, dtype=str, keep_default_na=False, usecols=cols)
+            ids = sample["psc_row_id"].astype(int)
+            for c in cols:
+                sample[f"psc_{c}"] = psc[c].reindex(ids).to_numpy()
+
+    for source, path, id_col in (("pep", pep_path, "id"),
+                                 ("sanctions", sanctions_path, "source_id")):
+        if not os.path.exists(path):
+            continue
+        header = pd.read_csv(path, nrows=0).columns
+        if "birth_date" not in header:
+            continue
+        lst = pd.read_csv(path, dtype=str, keep_default_na=False, usecols=[id_col, "birth_date"])
+        # sanctions has several seed rows per entity, all with the same birth_date
+        lookup = lst.drop_duplicates(id_col).set_index(id_col)["birth_date"]
+        mask = sample["list_source"] == source
+        sample.loc[mask, "list_birth_date"] = sample.loc[mask, "list_entity_id"].map(lookup).fillna("")
+    return sample
+
+
+def cmd_sample(args):
+    matches = pd.read_csv(args.matches, dtype=str, keep_default_na=False)
+    if matches.empty:
+        sys.exit("matches.csv is empty - run scripts/run_pipeline.py first.")
+    sample = draw_sample(matches, args.n_strong, args.n_weak)
+    sample = _attach_context(sample)
+    # Strong first, then weak; within a tier keep rows from the same company together.
+    sample["_t"] = (sample["tier"] != "strong").astype(int)
+    sample = sample.sort_values(["_t", "list_source", "company_number"]).drop(columns="_t")
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    sample[SAMPLE_COLS].to_csv(args.output, index=False, encoding="utf-8-sig")
+    print(f"Wrote {len(sample)} rows to {args.output}")
+    print(sample.groupby(["tier", "list_source"]).size().to_string())
+    print("\nFill the is_correct column with y / n / ?  (open with a text editor or "
+          "import into Excel as TEXT - leading zeros in company_number must survive).")
+
+
+# ---------------------------------------------------------------------------
+# score
+# ---------------------------------------------------------------------------
+
+def precision_table(sample: pd.DataFrame) -> pd.DataFrame:
+    """Per (tier, list_source) and per tier: n sampled, y, n, ?, precision."""
+    s = sample.copy()
+    s["label"] = s["is_correct"].astype(str).str.strip().str.lower().replace({"yes": "y", "no": "n"})
+    rows = []
+    groups = [(t, l, g) for (t, l), g in s.groupby(["tier", "list_source"])]
+    groups += [(t, "all", g) for t, g in s.groupby("tier")]
+    for tier, source, g in groups:
+        y, n = (g["label"] == "y").sum(), (g["label"] == "n").sum()
+        unsure = (g["label"] == "?").sum()
+        blank = len(g) - y - n - unsure
+        rows.append({
+            "tier": tier, "list": source, "sampled": len(g), "y": y, "n": n,
+            "unsure": unsure, "unlabelled": blank,
+            "precision": y / (y + n) if (y + n) else float("nan"),
+        })
+    return pd.DataFrame(rows).sort_values(["tier", "list"], ascending=[False, True]).reset_index(drop=True)
+
+
+def weighted_weak_precision(sample: pd.DataFrame):
+    """Population-weighted precision for weak matches (strata sizes from the sample file)."""
+    w = sample[sample["tier"] == "weak"].copy()
+    w["label"] = w["is_correct"].astype(str).str.strip().str.lower()
+    w = w[w["label"].isin(["y", "n"])]
+    if w.empty:
+        return None
+    total, acc = 0.0, 0.0
+    for _, g in w.groupby("stratum"):
+        size = float(g["stratum_size"].iloc[0])
+        acc += size * (g["label"] == "y").mean()
+        total += size
+    return acc / total if total else None
+
+
+def _fmt(p):
+    return "n/a" if p != p or p is None else f"{p:.0%}"
+
+
+def write_report(sample: pd.DataFrame, path: str):
+    t = precision_table(sample)
+    lines = [
+        "# Match precision (manual spot-check)", "",
+        "Hand-labelled sample of name matches: `y` = same person/company, `n` = different, "
+        "`?` = cannot tell. Precision = y / (y + n); `?` and blank rows are excluded.", "",
+        "| Tier | List | Sampled | y | n | ? | Unlabelled | Precision |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for r in t.itertuples():
+        lines.append(f"| {r.tier} | {r.list} | {r.sampled} | {r.y} | {r.n} | {r.unsure} | "
+                     f"{r.unlabelled} | {_fmt(r.precision)} |")
+
+    strong_all = t[(t.tier == "strong") & (t.list == "all")]
+    if len(strong_all):
+        r = strong_all.iloc[0]
+        lines += ["", f"**Strong matches were correct {r.y} out of {r.y + r.n} judged times "
+                      f"({_fmt(r.precision)}).**"]
+        if r.sampled and r.unlabelled:
+            lines += ["", f"Warning: {r.unlabelled} strong rows are still unlabelled."]
+    wp = weighted_weak_precision(sample)
+    if wp is not None:
+        lines += ["", f"Weak matches, population-weighted over score bands and lists: ~{wp:.1%} "
+                      "(the weak sample is stratified, so the raw weak row above is not "
+                      "representative of all weak matches)."]
+    lines += [
+        "", "## Notes", "",
+        "- Strong rows are a census (all strong matches are labelled) unless there were more "
+        "than the sample cap, so strong precision has no sampling error.",
+        "- Weak sample sizes are small; treat weak precision as indicative only.",
+        "- The labels were judged against Companies House birth month/year and the list's "
+        "birth date where available; `?` is used when neither side gives enough evidence.",
+        "- If strong precision is below ~70%, tighten the strong rule before freezing labels.",
+        "",
+    ]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return t
+
+
+def cmd_score(args):
+    sample = pd.read_csv(args.input, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    if "is_correct" not in sample.columns:
+        sys.exit("No is_correct column in the sample file.")
+    t = write_report(sample, args.output)
+    print(t.to_string(index=False))
+    print(f"\nWrote {args.output}")
+
+
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p1 = sub.add_parser("sample", help="write docs/spot_check_sample.csv")
+    p1.add_argument("--matches", default=MATCHES)
+    p1.add_argument("--output", default=SAMPLE)
+    p1.add_argument("--n-strong", type=int, default=50)
+    p1.add_argument("--n-weak", type=int, default=50)
+    p1.set_defaults(func=cmd_sample)
+
+    p2 = sub.add_parser("score", help="write docs/match_precision.md from the labelled sample")
+    p2.add_argument("--input", default=SAMPLE)
+    p2.add_argument("--output", default=PRECISION)
+    p2.set_defaults(func=cmd_score)
+
+    a = ap.parse_args()
+    a.func(a)
+
+
 
 ================================================
 FILE: src/text_encoding.py
@@ -1289,7 +2200,7 @@ Encoding utilities.
 
 The PEP export has a specific, known corruption: UTF-8 bytes that were
 decoded as Latin-1 at some point in the export pipeline, producing mojibake
-like 'CÃƒÂ®mpean' instead of 'CÃ¢mpean'. fix_mojibake() detects and repairs this.
+like 'CÃ®mpean' instead of 'Câmpean'. fix_mojibake() detects and repairs this.
 
 It is applied defensively across all three sources (PEP, sanctions, PSC)
 because there's no guarantee only one file is affected, but it is a no-op on
@@ -1301,10 +2212,10 @@ sanctions file) pass through unchanged.
 import re
 
 # A cheap heuristic pre-check: mojibake of this kind almost always produces
-# the byte sequence for 'Ãƒ' (U+00C3) followed by another Latin-1 supplement
+# the byte sequence for 'Ã' (U+00C3) followed by another Latin-1 supplement
 # character. If neither telltale character is present, skip the round-trip
 # entirely rather than risk corrupting genuinely clean text.
-_MOJIBAKE_HINT = re.compile(r"[ÃƒÃ‚]")
+_MOJIBAKE_HINT = re.compile(r"[ÃÂ]")
 
 
 def fix_mojibake(text: str) -> str:
@@ -1331,6 +2242,115 @@ def sniff_delimiter(sample: str) -> str:
     you pasted was tab-delimited; some OpenSanctions exports are comma-delimited).
     """
     return "\t" if sample.count("\t") > sample.count(",") else ","
+
+
+
+================================================
+FILE: tests/test_graph_builder.py
+================================================
+import os
+import sys
+
+import pandas as pd
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from graph_builder import (  # noqa: E402
+    address_key, build_graph, extract_postcode, first_address_line, psc_node_id,
+)
+
+IND = "individual-person-with-significant-control"
+CORP = "corporate-entity-person-with-significant-control"
+SHARES = "ownership-of-shares-75-to-100-percent"
+
+
+def _psc(rows):
+    df = pd.DataFrame(rows, columns=["company_number", "kind", "name", "normalized_name",
+                                     "address", "natures_of_control"])
+    df.insert(0, "psc_row_id", range(len(df)))
+    return df
+
+
+def _matches(rows=()):
+    return pd.DataFrame(list(rows), columns=["psc_row_id", "company_number", "psc_name",
+                                             "list_source", "list_name", "tier"])
+
+
+JOHN_HULL = ("John Paul Smith", "john paul smith", "Alvenga, Godmans Lane, Hull, HU10 7NY, England")
+
+
+def test_same_person_two_companies_is_one_node_with_two_edges():
+    psc = _psc([
+        ("00000001", IND, *JOHN_HULL, SHARES),
+        ("00000002", IND, *JOHN_HULL, SHARES),
+    ])
+    g, nodes, edges, _ = build_graph(psc, _matches())
+    person = "person:john paul smith|HU10 7NY"
+    assert (nodes["node_type"] == "person").sum() == 1
+    assert g.out_degree(person) == 2
+    assert set(g.successors(person)) == {"company:00000001", "company:00000002"}
+
+
+def test_same_name_different_postcode_stays_separate():
+    psc = _psc([
+        ("00000001", IND, *JOHN_HULL, SHARES),
+        ("00000002", IND, "John Paul Smith", "john paul smith", "1 High St, Leeds, LS7 3QB", SHARES),
+    ])
+    _, nodes, _, _ = build_graph(psc, _matches())
+    assert (nodes["node_type"] == "person").sum() == 2
+
+
+def test_flagged_match_lands_on_right_node():
+    psc = _psc([
+        ("00000001", IND, *JOHN_HULL, SHARES),
+        ("00000002", IND, "Jane Doe Brown", "jane doe brown", "2 Low Rd, York, YO1 7HH", SHARES),
+        ("00000002", CORP, "Electra Pro Ltd", "electra pro", "Moscow", SHARES),
+    ])
+    matches = _matches([
+        (2, "00000002", "Electra Pro Ltd", "sanctions", "ELECTRA PRO LLC", "strong"),
+        (0, "00000001", "John Paul Smith", "pep", "John Paul Smith", "strong"),
+        (0, "00000001", "John Paul Smith", "sanctions", "John Paul SMITH", "strong"),
+        (1, "00000002", "Jane Doe Brown", "pep", "Jane Brown", "weak"),
+    ])
+    g, _, _, unmapped = build_graph(psc, matches)
+    assert unmapped.empty
+    assert g.nodes["corp:electra pro"]["flagged"] is True
+    assert g.nodes["corp:electra pro"]["flag_source"] == "sanctions"
+    assert g.nodes["person:john paul smith|HU10 7NY"]["flag_source"] == "both"
+    jane = g.nodes["person:jane doe brown|YO1 7HH"]
+    assert jane["flagged"] is False and jane["weak_flagged"] is True
+    assert g.nodes["company:00000002"]["flagged"] is False
+
+
+def test_stale_match_is_reported_not_flagged():
+    psc = _psc([("00000001", IND, *JOHN_HULL, SHARES)])
+    matches = _matches([(0, "00000001", "Someone Else", "pep", "Someone Else", "strong")])
+    g, _, _, unmapped = build_graph(psc, matches)
+    assert len(unmapped) == 1
+    assert g.nodes["person:john paul smith|HU10 7NY"]["flagged"] is False
+
+
+def test_duplicate_psc_rows_merge_into_one_edge():
+    psc = _psc([
+        ("00000001", IND, *JOHN_HULL, SHARES),
+        ("00000001", IND, *JOHN_HULL, "voting-rights-75-to-100-percent"),
+    ])
+    g, _, edges, _ = build_graph(psc, _matches())
+    assert len(edges) == 1
+    data = g.edges["person:john paul smith|HU10 7NY", "company:00000001"]
+    assert data["natures_of_control"] == f"{SHARES};voting-rights-75-to-100-percent"
+    assert data["psc_row_ids"] == "0;1"
+
+
+def test_address_helpers():
+    assert extract_postcode("The Manor, Boddington, GL51 0tj, England") == "GL51 0TJ"
+    assert extract_postcode("Im Grund 12, 55491, Germany") == ""
+    assert first_address_line("3, Vicarage Crescent, London, SW11 3LP") == "3 Vicarage Crescent"
+    assert first_address_line("Third Floor, 207 Regent Street, London") == "Third Floor"
+    assert address_key("3,  Vicarage Crescent, London, SW11 3LP") == "sw11 3lp | 3 vicarage crescent"
+    assert address_key("Im Grund 12, Germany") == "im grund 12, germany"
+    assert psc_node_id(CORP, "electra pro", "Moscow") == "corp:electra pro"
+    assert psc_node_id(IND, "a b c", "Im Grund 12") == "person:a b c|im grund 12"
 
 
 
@@ -1518,7 +2538,7 @@ def test_legal_suffix_equivalence():
 
 
 def test_accent_stripping():
-    result = normalize_name("CÃ¢mpean")
+    result = normalize_name("Câmpean")
     assert result["normalized"] == "campean"
 
 
@@ -1592,5 +2612,63 @@ if __name__ == "__main__":
     test_normal_name_is_kept()
     test_rt_rev_real_person_is_kept()
     print("All pep_cleaning tests passed.")
+
+
+
+================================================
+FILE: tests/test_spot_check.py
+================================================
+import os
+import sys
+
+import pandas as pd
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from spot_check import draw_sample, precision_table, weighted_weak_precision  # noqa: E402
+
+
+def _matches():
+    rows = []
+    for i in range(10):
+        rows.append((i, f"0000000{i}", "strong", "pep", 100.0))
+    for i in range(10, 300):
+        rows.append((i, f"1{i:07d}", "weak", "pep" if i % 3 else "sanctions", 90.0 + (i % 10)))
+    df = pd.DataFrame(rows, columns=["psc_row_id", "company_number", "tier", "list_source", "score"])
+    df["list_entity_id"] = "E" + df["psc_row_id"].astype(str)
+    return df.astype(str)
+
+
+def test_all_strong_kept_and_weak_capped():
+    s = draw_sample(_matches(), 50, 50)
+    assert (s["tier"] == "strong").sum() == 10
+    assert (s["tier"] == "weak").sum() == 50
+    assert (s["is_correct"] == "").all()
+
+
+def test_sample_is_reproducible():
+    a = draw_sample(_matches())
+    b = draw_sample(_matches())
+    assert a["psc_row_id"].tolist() == b["psc_row_id"].tolist()
+
+
+def test_precision_ignores_unsure_and_blank():
+    s = pd.DataFrame({
+        "tier": ["strong"] * 5, "list_source": ["pep"] * 5,
+        "is_correct": ["y", "y", "n", "?", ""],
+    })
+    t = precision_table(s)
+    row = t[(t.tier == "strong") & (t.list == "all")].iloc[0]
+    assert row.y == 2 and row.n == 1 and row.unsure == 1 and row.unlabelled == 1
+    assert abs(row.precision - 2 / 3) < 1e-9
+
+
+def test_weighted_weak_precision():
+    s = pd.DataFrame({
+        "tier": ["weak"] * 4, "stratum": ["a", "a", "b", "b"],
+        "stratum_size": ["100", "100", "300", "300"],
+        "is_correct": ["y", "n", "n", "n"],
+    })
+    assert abs(weighted_weak_precision(s) - 0.125) < 1e-9
 
 

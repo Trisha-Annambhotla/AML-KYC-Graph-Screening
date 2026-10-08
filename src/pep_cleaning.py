@@ -25,9 +25,14 @@ MOJIBAKE_FIELDS = ["name", "aliases", "addresses"]
 # Positional titles that appear in the PEP list instead of a personal name --
 # these can never match a PSC name field and must be excluded up front rather
 # than silently failing every match attempt against them.
+# 'bishop of' / 'archbishop' are matched anywhere in the name, since titles
+# like "The Rt Rev. the Lord Bishop of St. Albans" put an honorific first.
+# 'rt rev' alone is deliberately NOT a pattern: it also prefixes real
+# people's names, e.g. "The Rt Rev. the Lord Harries of Pentregarth".
 POSITIONAL_TITLE_RE = re.compile(
-    r"^(the\s+)?(lord\s+bishop\s+of|bishop\s+of|lord\s+(?!\w+\s+\w+$)|"
-    r"baroness\s+of|rt\s+hon\s+the|speaker\s+of\s+the|president\s+of\s+the)\b",
+    r"^(?:(the\s+)?(lord\s+bishop\s+of|bishop\s+of|lord\s+(?!\w+\s+\w+$)|"
+    r"baroness\s+of|rt\s+hon\s+the|speaker\s+of\s+the|president\s+of\s+the)\b"
+    r"|.*(bishop\s+of\b|archbishop))",
     re.IGNORECASE,
 )
 

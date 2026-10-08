@@ -85,6 +85,29 @@ def test_company_exact_match_is_strong():
     assert out.loc[0, "tier"] == "strong"
 
 
+def test_apostrophe_name_is_two_words_not_three():
+    """'o neill' after normalization must not pass the 3-word rule."""
+    psc = _psc([("001", IND, "Paul O'Neill", "paul o neill", "British")])
+    pep = _pep([("P1", "Paul O'Neill", "paul o neill", "gb", "")])
+    out, _ = match(psc, pep, _sanctions())
+    assert len(out) == 1
+    assert out.loc[0, "tier"] == "weak"
+
+
+def test_short_company_alias_is_weak():
+    psc = _psc([
+        ("001", CORP, "Cp Holdings Limited", "cp", ""),
+        ("002", CORP, "B&H Limited", "b h", ""),
+    ])
+    sanc = _sanctions([
+        ("S1", "Organization", "CP", "sanctions_alias", "cp", "ru"),
+        ("S2", "Organization", "B&H", "sanctions_alias", "b h", "ru"),
+    ])
+    out, _ = match(psc, _pep(), sanc)
+    assert len(out) == 2
+    assert (out["tier"] == "weak").all()
+
+
 def test_fuzzy_match_is_weak():
     psc = _psc([("001", IND, "Ilya Vladimirovich Sidorov", "ilya vladimirovich sidorov", "Russian")])
     sanc = _sanctions([("S1", "Person", "Ilia Vladimirovich Sidorov", "sanctions_canonical",

@@ -27,13 +27,23 @@ Strong vs weak (rule_used records which mode labelled the row):
         the list's ';'-separated dates may match).
     Mode B -- fallback, chosen per list when Mode A's columns are missing:
         person strong = exact name match, >= 3 name words, and a PSC
-        nationality consistent with the list row's countries.
-    Companies (both modes, recorded as B): strong = exact name match.
+        nationality consistent with the list row's countries. Words are
+        counted with apostrophes removed first, so "Paul O'Neill" is 2 words,
+        not 3 ("paul o neill" after normalization).
+    Companies (both modes, recorded as B): strong = exact name match AND
+        >= 2 real words (tokens of 2+ characters, legal suffixes already
+        removed), so short aliases like "CP", "SIG" or "B&H" stay weak.
     Everything else scoring >= 90 is weak.
 
-Each output row is one (PSC row, list entity) pair -- if several aliases of
-the same sanctioned entity match, the best one is kept (strong over weak,
-then higher score, then canonical over alias).
+Choices not spelled out in the plan (agreed at Checkpoint 1):
+    - Person blocking: the PSC surname may appear anywhere in the list name,
+      not only as its last word (see above).
+    - PEP: only the main `name` is matched, not PEP `aliases` (mostly
+      "Surname, L." forms).
+    - Aliases are deduplicated: each output row is one (PSC row, list
+      entity) pair. If several aliases of the same sanctioned entity match,
+      the best one is kept (strong over weak, then higher score, then
+      canonical over alias).
 
 Run directly:
     python src/matching.py
@@ -48,6 +58,8 @@ from collections import Counter, defaultdict
 import pandas as pd
 from rapidfuzz import fuzz, process
 
+from name_normalization import normalize_name
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 INTERIM = os.path.join(ROOT, "data", "interim")
 PROCESSED = os.path.join(ROOT, "data", "processed")
@@ -59,6 +71,8 @@ MATCHES_OUTPUT = os.path.join(PROCESSED, "matches.csv")
 
 SCORE_CUTOFF = 90
 MIN_STRONG_PERSON_TOKENS = 3
+MIN_STRONG_COMPANY_TOKENS = 2
+MIN_REAL_TOKEN_LEN = 2
 
 PERSON_SCHEMAS = {"Person"}
 COMPANY_SCHEMAS = {"Organization", "LegalEntity", "Company"}
@@ -169,20 +183,35 @@ def detect_mode(psc_columns, list_columns) -> str:
     return "B"
 
 
-def person_tier(mode: str, score: float, exact: bool, psc_norm: str,
+_APOSTROPHE_RE = re.compile(r"['’`]")
+
+
+def person_word_count(raw_name: str) -> int:
+    """Words in a person's name, counted before the apostrophe split:
+    "Paul O'Neill" -> 2 (normalization alone would give "paul o neill")."""
+    return len(normalize_name(_APOSTROPHE_RE.sub("", raw_name or ""))["tokens"])
+
+
+def company_real_word_count(normalized: str) -> int:
+    """Tokens of 2+ characters: "b h" (from "B&H") -> 0, "nord gold" -> 2."""
+    return sum(len(t) >= MIN_REAL_TOKEN_LEN for t in (normalized or "").split())
+
+
+def person_tier(mode: str, score: float, exact: bool, psc_name: str,
                 nationality: str, countries: str,
                 psc_ym=None, list_birth_date: str = "") -> str:
     if mode == "A":
         strong = score >= SCORE_CUTOFF and psc_ym is not None and \
             psc_ym in birth_year_months(list_birth_date)
     else:
-        strong = exact and len(psc_norm.split()) >= MIN_STRONG_PERSON_TOKENS and \
+        strong = exact and person_word_count(psc_name) >= MIN_STRONG_PERSON_TOKENS and \
             nationality_consistent(nationality, countries)
     return "strong" if strong else "weak"
 
 
-def company_tier(exact: bool) -> str:
-    return "strong" if exact else "weak"
+def company_tier(exact: bool, normalized: str) -> str:
+    strong = exact and company_real_word_count(normalized) >= MIN_STRONG_COMPANY_TOKENS
+    return "strong" if strong else "weak"
 
 
 # ---------------------------------------------------------------------------
@@ -328,20 +357,20 @@ def match(psc: pd.DataFrame, pep: pd.DataFrame, sanctions: pd.DataFrame):
             df["tier"] = [
                 person_tier(mode, s, e, n, nat, c, ym, bd)
                 for s, e, n, nat, c, ym, bd in zip(
-                    df["score"], df["exact"], df["psc_norm"], df["nationality"],
+                    df["score"], df["exact"], df["name"], df["nationality"],
                     df["countries"], yms, df["list_birth_date"])
             ]
             df["rule_used"] = mode
             frames.append(df.assign(list_source=source))
 
-        # Companies (exact-name rule in both modes)
+        # Companies (exact-name + 2 real words rule in both modes)
         if len(companies):
             all_names = corp_names + companies["list_norm"].unique().tolist()
             pairs = find_candidates(corp_names, companies["list_norm"].unique().tolist(),
                                     _rarest_token_key_fn(all_names))
             df = _expand(pairs, corps, companies)
             if len(df):
-                df["tier"] = [company_tier(e) for e in df["exact"]]
+                df["tier"] = [company_tier(e, n) for e, n in zip(df["exact"], df["psc_norm"])]
                 df["rule_used"] = "B"
                 frames.append(df.assign(list_source=source))
 

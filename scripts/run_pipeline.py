@@ -1,6 +1,7 @@
 """
-Runs the analysis pipeline (docs/implementation_plan.md, Phases 1-4) on the
-cleaned files in data/interim/. Does NOT run preprocessing -- raw data is not
+Runs the analysis pipeline (docs/implementation_plan.md, Phases 1-5) on the
+cleaned files in data/interim/. Phase 1b (the manual spot-check) is not part
+of it: `python src/spot_check.py sample` would overwrite hand labels. Does NOT run preprocessing -- raw data is not
 available, and run_preprocessing.py would overwrite data/interim/.
 
 Run from the project root:
@@ -12,6 +13,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+import case_studies  # noqa: E402
 import features  # noqa: E402
 import graph_builder  # noqa: E402
 import matching  # noqa: E402
@@ -50,6 +52,12 @@ def main():
     print(f"  positives per fold: {positives_per_fold}")
     print(f"  -> {train.RESULTS}")
     print(f"  -> {train.PREDICTIONS_OUTPUT}")
+
+    print("\n=== Phase 5: Case studies ===")
+    cases = case_studies.run()
+    for k, v in cases.items():
+        print(f"  {k}: {v}")
+    print(f"  -> {case_studies.DOC_OUTPUT}")
 
 
 if __name__ == "__main__":

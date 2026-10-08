@@ -170,12 +170,16 @@ Below is the full plan. Save it in your repo as **`docs/implementation_plan.md`*
 
 **Build:** `src/case_studies.py`, with outputs `results/case_*.png` and `docs/case_studies.md`.
 
-1. Pick 4 companies from the out-of-fold predictions:
-   * 2 high-scoring true positives
-   * 1 high-scoring false positive
-   * 1 positive the models missed
+*(Updated 2026-10-08 after Checkpoint 4: no positive ranked highly (best rank ~3,700-4,800), so the cases explain why the models failed rather than show successes.)*
+
+1. Pick 4 cases from the out-of-fold predictions:
+   * **the best-ranked risky company**: why did it still rank low?
+   * **the highest-scoring false positive**: what made it look risky (likely a hub or busy-address cluster)?
+   * **a typical risky company**: show that it looks like any other company.
+   * **Peter Caruana's group** (the one flagged owner with 8 companies): the only place feature 1 fires.
 2. For each one, draw the 2-hop neighbourhood. Colour companies, people and flagged nodes differently, and label each node.
 3. In `case_studies.md`, write each company's feature values, the model scores, and a short plain-English explanation of why it scored that way.
+4. **Random Forest vs Logistic Regression comparison**: the metrics side by side, how far their rankings agree, where each one ranked the risky companies, and how many risky companies each finds at larger k.
 
 ## Phase 6: Documentation and report material
 

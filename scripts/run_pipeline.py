@@ -12,8 +12,10 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+import features  # noqa: E402
 import graph_builder  # noqa: E402
 import matching  # noqa: E402
+import train  # noqa: E402
 
 
 def main():
@@ -31,6 +33,23 @@ def main():
     print(f"  unmapped strong matches: {len(stats['unmapped'])}")
     print(f"  -> {graph_builder.GRAPH_OUTPUT}")
     print(f"  -> {graph_builder.STATS_OUTPUT}")
+
+    print("\n=== Phase 3: Features and labels ===")
+    _, summary = features.run()
+    for k in ("n_companies", "n_positive", "pct_positive", "n_positive_weak",
+              "label_source", "nonzero", "hub_companies", "hub_positives",
+              "n_split_groups", "largest_split_group", "positive_split_groups"):
+        print(f"  {k}: {summary[k]}")
+    print(f"  -> {features.FEATURES_OUTPUT}")
+    print(f"  -> {features.STATS_OUTPUT}")
+
+    print("\n=== Phase 4: Train and compare the models ===")
+    metrics, _, positives_per_fold = train.run()
+    cols = ["run", "method", "pr_auc_mean", "pr_auc_std", "hits@100", "precision@100"]
+    print(metrics[cols].to_string(index=False))
+    print(f"  positives per fold: {positives_per_fold}")
+    print(f"  -> {train.RESULTS}")
+    print(f"  -> {train.PREDICTIONS_OUTPUT}")
 
 
 if __name__ == "__main__":

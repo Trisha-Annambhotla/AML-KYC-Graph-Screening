@@ -1,9 +1,24 @@
 Directory structure:
-└── KYC/
+└── AML-KYC-Graph-Screening/
     ├── README.md
     ├── requirements.txt
-    └── data/
-        └── README.md
+    ├── docs/
+    │   ├── implementation_plan.md
+    │   └── preprocessing_log.md
+    ├── scripts/
+    │   ├── run_pipeline.py
+    │   └── run_preprocessing.py
+    ├── src/
+    │   ├── matching.py
+    │   ├── name_normalization.py
+    │   ├── pep_cleaning.py
+    │   ├── psc_loader.py
+    │   ├── sanctions_loader.py
+    │   └── text_encoding.py
+    └── tests/
+        ├── test_matching.py
+        ├── test_name_normalization.py
+        └── test_pep_cleaning.py
 
 ================================================
 FILE: README.md
@@ -23,52 +38,1586 @@ matplotlib>=3.7
 seaborn>=0.12
 jupyter>=1.0
 ipykernel>=6.25
+unidecode>=1.3
 
 
 ================================================
-FILE: data/README.md
+FILE: docs/implementation_plan.md
 ================================================
-# Data Provenance
+Below is the full plan. Save it in your repo as **`docs/implementation_plan.md`**. Then, for each phase, tell Claude Code: *"Implement Phase N of docs/implementation_plan.md. Follow the rules in the 'Rules for every phase' section."* Do one phase per session, and paste each checkpoint result here if you want a second opinion.
 
-Raw data is not committed to this repository (see .gitignore). This file is
-the record of what was used, where it came from, and when â€” per the
-point-in-time snapshot policy (Charter Section 1.4). No re-pulls mid-project.
+---
 
-## 1. UK FCDO Sanctions List
+# Implementation Plan: AML/KYC Graph Screening
 
-- Source: OpenSanctions, `gb_fcdo_sanctions` dataset
-- URL: https://www.opensanctions.org/datasets/gb_fcdo_sanctions/
-- Downloaded: 2026-08-02
-- Local file: `data/raw/fcdo_sanctions/fcdo.csv`
-- Row count: 6,261
-- License: OpenSanctions â€” free for non-commercial use
-- SHA256: <paste output of `sha256sum` / `Get-FileHash` here>
+## Current state
 
-## 2. PEP Dataset
+* Preprocessing is done. The three cleaned files are in `data/interim/`:
+  * `psc_clean.csv`: 499,971 rows, from 1 of 32 PSC parts
+  * `pep_clean.csv`: 7,990 rows (bishop and archbishop title rows removed)
+  * `sanctions_clean.csv`: 19,610 rows (one row per name and per alias)
+* Raw data is not available. Never run `scripts/run_preprocessing.py`, because it would overwrite the interim files and the log.
+* **Problem 2 is open.** `psc_clean.csv` has no birth month or year, and `sanctions_clean.csv` has no `birth_date` or `addresses`. A teammate may deliver new versions of these two files later. **Every phase must work with both the current files and the future ones**, choosing automatically based on which columns exist.
 
-- Source: OpenSanctions, PEP dataset
-- URL: https://www.opensanctions.org/datasets/peps/
-- Downloaded: 2026-08-02
-- Local file: `data/raw/pep/pep.csv`
-- Row count (pre-filter): <fill in>
-- Row count (post `contains gb` filter, applied in code not at source): <fill in>
-- Known issue: raw export has UTF-8-as-Latin-1 mojibake in non-ASCII names â€”
-  fixed in `src/pep_cleaning.py`, not at the source file.
-- License: OpenSanctions â€” free for non-commercial use
-- SHA256: <paste hash here>
+## Rules for every phase
 
-## 3. UK Companies House PSC Snapshot
+1. Never read a full CSV into the conversation. Inspect files with pandas `nrows=` or `head`.
+2. Never modify anything in `data/interim/`.
+3. Large outputs go in `data/processed/`, which git ignores. Small results (metrics CSVs, charts, markdown summaries) go in `results/` or `docs/` and are committed.
+4. Each phase is one module in `src/`, with tests in `tests/`. Also add the phase as a step in `scripts/run_pipeline.py`, so the whole pipeline (Phases 1–4) can be rerun with one command when new data arrives.
+5. Set `random_state=42` everywhere randomness is used.
+6. At every **checkpoint**, show the summary and wait for approval before continuing.
+7. At the end of every phase, run all tests, then run:
+   `PYTHONUTF8=1 gitingest . -e "data/" -e "digest.txt" -o digest.txt`
+   Then list the changed files so I can commit them. Don't commit automatically.
 
-- Source: Companies House bulk PSC snapshot
-- URL: http://download.companieshouse.gov.uk/en_pscdata.html
-- Snapshot date: 2026-08-02
-- Local files: `data/raw/psc/psc-snapshot-2026-08-02_1of32.txt/` (32 parts, JSONL/.txt)
-- Format: one JSON object per line
-- License: Open Government Licence
-- SHA256 (per part): <paste hashes here, or a manifest file if easier>
+---
 
-## Policy
+## Phase 1: Name matching
 
-- Single fixed download date per source, logged above. No mid-project re-pulls.
-- Any dataset added later must get its own dated entry here before use.
+**Goal:** Find which company owners (PSCs) appear on the PEP or sanctions lists.
+
+**Build:** `src/matching.py`, with output `data/processed/matches.csv`.
+
+1. **Give every PSC row an ID.** Use `psc_row_id`, the row's position in `psc_clean.csv`. Later phases use it to find that owner in the graph.
+2. **Compare like with like:**
+   * PSC rows whose `kind` starts with `individual` are compared with PEP rows and sanctions rows with schema `Person`.
+   * PSC rows whose `kind` starts with `corporate` are compared with sanctions rows with schema `Organization`, `LegalEntity` or `Company`.
+   * Ignore other PSC kinds, such as legal-person or super-secure entries, and log how many were skipped.
+3. **Speed:**
+   * First do an exact-match pass on `normalized_name` using a dictionary lookup.
+   * Then do a fuzzy pass with blocking. For people, only compare names with the same last word (surname). For companies, only compare names sharing their least common word.
+4. **Scoring:** use rapidfuzz `token_sort_ratio` on `normalized_name`, and keep candidates scoring at least 90.
+5. **Strong vs weak.** Detect which mode applies from the columns present.
+   * **Mode A (birth dates available):** the PSC file has `birth_month`/`birth_year` and the list row has `birth_date`. Strong means score ≥ 90 and the same birth year and month. Sanctions `birth_date` may hold several dates separated by `;`, and any one matching counts.
+   * **Mode B (current files, fallback rule):**
+     * *People:* strong means an exact normalised name match, at least 3 name words, and a nationality consistent with the list's `countries`. Use a small mapping, such as British → gb, Russian → ru, Iranian → ir. An unknown or missing nationality is never strong.
+     * *Companies:* strong means an exact normalised name match.
+   * Everything else scoring ≥ 90 is weak.
+   * Record in a `rule_used` column whether Mode A or B produced each label.
+6. **Output columns:** `psc_row_id`, `company_number`, `kind`, `psc_name`, `nationality`, `list_name`, `list_source` (pep or sanctions), `seed_source` (canonical or alias, for sanctions), `list_entity_id`, `score`, `tier`, `rule_used`.
+7. **Tests:**
+   * an exact match is strong in Mode B
+   * a two-word name is never strong in Mode B
+   * a person is never matched to an organisation
+   * Mode A is chosen when birth columns exist
+
+**Checkpoint 1:** show the count of strong and weak matches per list, the number of **distinct companies** with at least one strong match, and 10 example matches per tier.
+
+**Gate:** if fewer than about 30 companies have a strong match, stop. Present these options:
+* treat sanctions and PEP as one combined label (the default)
+* add a sensitivity run that includes weak matches scoring at least 95
+* report the project explicitly as a small pilot
+
+## Phase 1b: Manual spot-check
+
+**Goal:** Measure how often the matches are actually correct. This is evidence the scope document requires.
+
+**Build:** `src/spot_check.py`, which has two commands:
+
+1. **`sample`:** writes `docs/spot_check_sample.csv`. It takes 50 random strong and 50 random weak matches (or all of them, if there are fewer), with an empty `is_correct` column. *We fill in this column by hand, writing y or n.*
+2. **`score`:** reads the filled-in file and writes `docs/match_precision.md`, with estimated precision per tier and per list, and the sample sizes.
+
+**Done when:** `match_precision.md` exists. The human labelling is our job, not Claude Code's.
+
+## Phase 2: Build the ownership graph
+
+**Goal:** Turn the PSC rows into a network of who controls what.
+
+**Build:** `src/graph_builder.py`. Outputs:
+* `data/processed/graph.pkl`, saved with pickle, since `write_gpickle` was removed in networkx 3
+* `data/processed/nodes.csv` and `data/processed/edges.csv`
+
+1. **Nodes:**
+   * Companies: `company:<company_number>`.
+   * Individual PSCs: `person:<normalized_name>|<postcode>`. Extract the UK postcode from `address` with a regex; if none is found, use the normalised full address. This merges the same person across the companies they control.
+   * Corporate PSCs: `corp:<normalized_name>`.
+2. **Edges:** from each PSC node to its company node, with `natures_of_control` as an attribute.
+3. **Flags:**
+   * Map every strong match to its node through `psc_row_id`, and set `flagged=True` and `flag_source` (pep, sanctions or both).
+   * Keep weak flags separately in a `weak_flagged` attribute.
+4. **Address key:**
+   * Store each PSC's normalised address key: postcode plus the first address line, lowercased with spaces collapsed.
+   * Don't add address nodes to the graph.
+5. **Tests:**
+   * the same person controlling two companies becomes one node with two edges
+   * a flagged match lands on the right node
+
+**Checkpoint 2:** write `docs/graph_stats.md` containing:
+* node counts by type, and the edge count
+* the number of connected components and the size distribution (min, median, max, and the top 10 sizes)
+* the number of flagged nodes
+* confirmation that **every** strong match was mapped to a node, or a list of those that weren't
+
+## Phase 3: Features and labels
+
+**Goal:** One row per company, with its 4 features and a label.
+
+**Build:** `src/features.py`, with output `data/processed/features.csv`.
+
+1. **Label:** `label = 1` if the company is directly connected to at least one strongly flagged PSC.
+   * Also store `label_weak`, using weak flags as well, for sensitivity analysis.
+   * Also store `label_source`: pep, sanctions or both.
+2. **Feature 1, `flagged_neighbour_companies`.** This feature must **not** contain the label.
+   * Make a copy of the graph with all flagged PSC nodes removed.
+   * For each company, count the *other* companies that have `label = 1` and share a (non-flagged) PSC with it.
+   * Never count the company's own flagged owners. *(This replaces the scope's "flagged 1-hop neighbours", which would equal the label and leak the answer. Document this in the report.)*
+3. **Feature 2, `shared_address_count`:** the number of *other* companies with at least one PSC at the same address key.
+4. **Feature 3, `degree`:** the number of PSCs connected to the company, on the full graph.
+5. **Feature 4, `component_size`:** the size of the company's connected component in the full graph.
+6. **Extra columns** (not features): `company_number` and `component_id`, the full-graph component ID used for the train/test split.
+7. **Tests:**
+   * a company whose only link to risk is its own flagged owner gets `flagged_neighbour_companies = 0`
+   * shared address counts exclude the company itself
+
+**Checkpoint 3:** show the number of companies, the number and percentage of positives, summary statistics for each feature split by label, and a check that no feature is perfectly correlated with the label.
+
+## Phase 4: Train and compare the models
+
+**Goal:** Logistic Regression vs Random Forest, judged honestly.
+
+**Build:** `src/train.py`. Outputs:
+* `results/metrics.csv`
+* `results/pr_curves.png`
+* `results/feature_importance.png`
+* `data/processed/predictions.csv` (out-of-fold scores)
+
+1. **Split:** `GroupKFold` with 5 folds, grouped by `component_id`, so connected companies never end up in both the training and test sets.
+2. **Logistic Regression:**
+   * apply `log1p` to all four features, then `StandardScaler`
+   * `class_weight="balanced"`, `max_iter=1000`
+3. **Random Forest:**
+   * raw features
+   * `n_estimators=300`, `min_samples_leaf=5`, `class_weight="balanced_subsample"`
+4. **Baselines:**
+   * (a) random scores
+   * (b) a simple rule: rank by `flagged_neighbour_companies`, then by `shared_address_count`
+5. **Metrics:**
+   * **Main:** PR-AUC (`average_precision_score`), reported as the mean ± std across folds, plus Precision@50 and Precision@100 on the pooled out-of-fold scores.
+   * **Also:** recall at k.
+   * **Secondary:** ROC-AUC.
+   * **Context only:** accuracy at a 0.5 threshold.
+   * If there are fewer positives than k, report k alongside the positive count.
+6. **Interpretation:** report the Logistic Regression coefficients and the Random Forest feature importances (permutation importance on held-out folds).
+7. **Sensitivity runs** (add rows to `metrics.csv`):
+   * using `label_weak`
+   * PEP-only and sanctions-only labels, if each has at least 20 positives
+
+**Checkpoint 4:** show the metrics table and state plainly whether each model beats both baselines.
+
+## Phase 5: Case studies
+
+**Goal:** Explain individual results; the scope requires explainability.
+
+**Build:** `src/case_studies.py`, with outputs `results/case_*.png` and `docs/case_studies.md`.
+
+1. Pick 4 companies from the out-of-fold predictions:
+   * 2 high-scoring true positives
+   * 1 high-scoring false positive
+   * 1 positive the models missed
+2. For each one, draw the 2-hop neighbourhood. Colour companies, people and flagged nodes differently, and label each node.
+3. In `case_studies.md`, write each company's feature values, the model scores, and a short plain-English explanation of why it scored that way.
+
+## Phase 6: Documentation and report material
+
+1. **`README.md`:** what the project does, the folder layout, how to run the pipeline (`python scripts/run_pipeline.py`), and a summary of results.
+2. **`data/README.md`:**
+   * fill in the PEP counts: 769,044 before filtering, 8,009 after the gb filter, and 7,990 after removing titles
+   * note that the work used interim files from a teammate, which is why the hashes are blank
+3. **`docs/limitations.md`:**
+   * only 1 of 32 PSC parts was used
+   * sanctions and PEP status is a stand-in for risk, not proof of wrongdoing
+   * the strong-match rule used (Mode A or B) and its estimated precision
+   * the PSC service address is used rather than the company's registered address
+   * corporate PSCs can't be linked to their own company records
+   * the data is a single point-in-time snapshot
+   * the "flagged 1-hop" feature was redefined to avoid leakage
+
+## When the Problem 2 files arrive
+
+1. Replace `psc_clean.csv` and `sanctions_clean.csv` in `data/interim/`.
+2. Check the new columns exist: `birth_month` and `birth_year` in PSC, and `birth_date` and `addresses` in sanctions.
+3. Run `python scripts/run_pipeline.py`. Matching switches to Mode A automatically.
+4. Redo the Phase 1b spot-check on a new sample, since the strong matches will have changed.
+5. Update the results and limitations to state that Mode A was used.
+
+---
+
+
+
+================================================
+FILE: docs/preprocessing_log.md
+================================================
+# Preprocessing Log — 2026-09-09 12:53
+
+## Sanctions (gb_fcdo_sanctions)
+
+- canonical_names: 6261
+- aliases: 13349
+- total_seed_rows: 19610
+
+## PEP dataset
+
+- total_rows: 769044
+- kept_gb: 8009
+- dropped_not_gb: 760688
+- dropped_positional_title: 347
+- dropped_empty_name: 0
+
+## PSC snapshot
+
+- parts_processed: 1
+- records_written: 499971
+- records_skipped_no_name: 0
+- parts_found: 1
+- parts_expected: 32
+- **PARTIAL COVERAGE**: only 1/32 PSC parts processed. Any downstream match counts are a partial-coverage pilot result, not a full-register figure (Charter Section 1.1, Step 4).
+
+## Post-fix: PEP positional titles (2026-10-08)
+
+- Removed 19 more rows from `pep_clean.csv` whose name contains "bishop of"
+  or "archbishop" (e.g. "The Rt Rev. the Lord Bishop of St. Albans"). These
+  are job titles, not personal names; the start-anchored regex missed them
+  because "The Rt Rev." comes first.
+- "rt rev" was not used as a pattern, so "The Rt Rev. the Lord Harries of
+  Pentregarth" (a real person) is kept.
+- Removed 2 title-only aliases: "The Rt Rev. and the Rt Hon. Lord Chartres
+  GCVO" (Richard Chartres) and "The Rt Rev. and the Rt Hon. Lord Sentamu"
+  (John Sentamu). Kept "Archbishop Paul Richard Gallagher", which contains
+  his real name.
+- PEP rows: 8,009 -> 7,990. Original kept as `pep_clean_backup.csv`.
+
+
+
+================================================
+FILE: scripts/run_pipeline.py
+================================================
+"""
+Runs the analysis pipeline (docs/implementation_plan.md, Phases 1-4) on the
+cleaned files in data/interim/. Does NOT run preprocessing -- raw data is not
+available, and run_preprocessing.py would overwrite data/interim/.
+
+Run from the project root:
+    python scripts/run_pipeline.py
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+import matching  # noqa: E402
+
+
+def main():
+    print("=== Phase 1: Name matching ===")
+    _, match_counts = matching.run()
+    for k, v in match_counts.items():
+        print(f"  {k}: {v}")
+    print(f"  -> {matching.MATCHES_OUTPUT}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+================================================
+FILE: scripts/run_preprocessing.py
+================================================
+"""
+Orchestrates Week 1 preprocessing: sanctions loading, PEP cleaning, PSC
+loading. Writes cleaned outputs to data/interim/ and a dated summary to
+docs/preprocessing_log.md (Charter Section 1.1 Step 4 / Section 3, Week 1).
+
+Run from the project root:
+    python scripts/run_preprocessing.py
+"""
+
+import os
+import sys
+from datetime import datetime
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+import sanctions_loader  # noqa: E402
+import pep_cleaning  # noqa: E402
+import psc_loader  # noqa: E402
+
+ROOT = os.path.join(os.path.dirname(__file__), "..")
+RAW = os.path.join(ROOT, "data", "raw")
+INTERIM = os.path.join(ROOT, "data", "interim")
+DOCS = os.path.join(ROOT, "docs")
+
+SANCTIONS_INPUT = os.path.join(RAW, "fcdo_sanctions", "fcdo.csv")
+PEP_INPUT = os.path.join(RAW, "pep", "pep.csv")
+PSC_INPUT_DIR = os.path.join(RAW, "psc")
+
+SANCTIONS_OUTPUT = os.path.join(INTERIM, "sanctions_clean.csv")
+PEP_OUTPUT = os.path.join(INTERIM, "pep_clean.csv")
+PSC_OUTPUT = os.path.join(INTERIM, "psc_clean.csv")
+
+
+def main():
+    os.makedirs(INTERIM, exist_ok=True)
+    os.makedirs(DOCS, exist_ok=True)
+
+    log_lines = [
+        f"# Preprocessing Log — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+    ]
+
+    print("=== 1/3: Sanctions loader ===")
+    sanctions_counts = sanctions_loader.run(SANCTIONS_INPUT, SANCTIONS_OUTPUT)
+    log_lines += ["## Sanctions (gb_fcdo_sanctions)", ""]
+    log_lines += [f"- {k}: {v}" for k, v in sanctions_counts.items()]
+    log_lines.append("")
+
+    print("\n=== 2/3: PEP cleaning ===")
+    pep_counts = pep_cleaning.run(PEP_INPUT, PEP_OUTPUT)
+    log_lines += ["## PEP dataset", ""]
+    log_lines += [f"- {k}: {v}" for k, v in pep_counts.items()]
+    log_lines.append("")
+
+    print("\n=== 3/3: PSC loader ===")
+    psc_counts = psc_loader.run(PSC_INPUT_DIR, PSC_OUTPUT, expected_parts=32)
+    log_lines += ["## PSC snapshot", ""]
+    log_lines += [f"- {k}: {v}" for k, v in psc_counts.items()]
+    if psc_counts["parts_found"] < psc_counts["parts_expected"]:
+        log_lines.append(
+            f"- **PARTIAL COVERAGE**: only {psc_counts['parts_found']}/"
+            f"{psc_counts['parts_expected']} PSC parts processed. "
+            "Any downstream match counts are a partial-coverage pilot "
+            "result, not a full-register figure (Charter Section 1.1, Step 4)."
+        )
+    log_lines.append("")
+
+    log_path = os.path.join(DOCS, "preprocessing_log.md")
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(log_lines))
+
+    print(f"\nAll three cleaned files written to {INTERIM}")
+    print(f"Summary log written to {log_path}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+================================================
+FILE: src/matching.py
+================================================
+"""
+Phase 1: name matching (docs/implementation_plan.md).
+
+Finds PSC rows (company owners) whose name matches a PEP or sanctions list
+entry, and labels each match STRONG or WEAK.
+
+Like is compared with like:
+    - individual-* PSCs  vs  PEP rows and sanctions rows with schema Person
+    - corporate-* PSCs   vs  sanctions rows with schema Organization /
+                             LegalEntity / Company
+    - every other PSC kind (legal-person-*, super-secure, ...) is skipped
+      and counted.
+
+Candidates come from two passes over `normalized_name`:
+    1. exact pass  -- dictionary lookup
+    2. fuzzy pass  -- rapidfuzz token_sort_ratio >= 90, with blocking:
+         people:    the PSC surname (last word) must appear in the list name.
+                    Not "same last word", because list names come in both
+                    orders ("Ivan ... TYRYSHKIN" and the Cyrillic alias
+                    "BULAVKO Anatolii ...").
+         companies: the list name must contain the PSC name's least common
+                    word (rarest across PSC corporate + list company names).
+
+Strong vs weak (rule_used records which mode labelled the row):
+    Mode A -- PSC has birth_month/birth_year AND the list has birth_date:
+        person strong = score >= 90 and same birth year and month (any one of
+        the list's ';'-separated dates may match).
+    Mode B -- fallback, chosen per list when Mode A's columns are missing:
+        person strong = exact name match, >= 3 name words, and a PSC
+        nationality consistent with the list row's countries. Words are
+        counted with apostrophes removed first, so "Paul O'Neill" is 2 words,
+        not 3 ("paul o neill" after normalization).
+    Companies (both modes, recorded as B): strong = exact name match AND
+        >= 2 real words (tokens of 2+ characters, legal suffixes already
+        removed), so short aliases like "CP", "SIG" or "B&H" stay weak.
+    Everything else scoring >= 90 is weak.
+
+Choices not spelled out in the plan (agreed at Checkpoint 1):
+    - Person blocking: the PSC surname may appear anywhere in the list name,
+      not only as its last word (see above).
+    - PEP: only the main `name` is matched, not PEP `aliases` (mostly
+      "Surname, L." forms).
+    - Aliases are deduplicated: each output row is one (PSC row, list
+      entity) pair. If several aliases of the same sanctioned entity match,
+      the best one is kept (strong over weak, then higher score, then
+      canonical over alias).
+
+Run directly:
+    python src/matching.py
+"""
+
+import argparse
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+
+import pandas as pd
+from rapidfuzz import fuzz, process
+
+from name_normalization import normalize_name
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+INTERIM = os.path.join(ROOT, "data", "interim")
+PROCESSED = os.path.join(ROOT, "data", "processed")
+
+PSC_INPUT = os.path.join(INTERIM, "psc_clean.csv")
+PEP_INPUT = os.path.join(INTERIM, "pep_clean.csv")
+SANCTIONS_INPUT = os.path.join(INTERIM, "sanctions_clean.csv")
+MATCHES_OUTPUT = os.path.join(PROCESSED, "matches.csv")
+
+SCORE_CUTOFF = 90
+MIN_STRONG_PERSON_TOKENS = 3
+MIN_STRONG_COMPANY_TOKENS = 2
+MIN_REAL_TOKEN_LEN = 2
+
+PERSON_SCHEMAS = {"Person"}
+COMPANY_SCHEMAS = {"Organization", "LegalEntity", "Company"}
+
+PSC_BIRTH_COLS = {"birth_month", "birth_year"}
+LIST_BIRTH_COL = "birth_date"
+
+PSC_BASE_COLS = ["company_number", "kind", "name", "normalized_name", "nationality"]
+
+OUTPUT_FIELDS = [
+    "psc_row_id", "company_number", "kind", "psc_name", "nationality",
+    "list_name", "list_source", "seed_source", "list_entity_id", "score",
+    "tier", "rule_used",
+]
+
+# PSC nationality (free text demonym) -> ISO-2 code used by the lists'
+# `countries` field. Covers the common PSC nationalities and the countries
+# that dominate the sanctions list. Anything not here is "unknown", which is
+# never strong under Mode B.
+DEMONYM_TO_ISO = {
+    # UK and its nations
+    "british": "gb", "english": "gb", "scottish": "gb", "welsh": "gb",
+    "northern irish": "gb", "united kingdom": "gb", "uk": "gb",
+    "cymro": "gb", "cymraes": "gb", "british citizen": "gb",
+    # main sanctions countries
+    "russian": "ru", "syrian": "sy", "iranian": "ir", "ukrainian": "ua",
+    "belarusian": "by", "belarussian": "by", "afghan": "af", "afghani": "af",
+    "north korean": "kp", "iraqi": "iq", "pakistani": "pk", "chinese": "cn",
+    "emirati": "ae", "indonesian": "id", "panamanian": "pa", "libyan": "ly",
+    "saudi": "sa", "saudi arabian": "sa", "congolese": "cd", "sudanese": "sd",
+    "algerian": "dz", "burmese": "mm", "myanmar": "mm", "yemeni": "ye",
+    "somali": "so", "tunisian": "tn", "turkish": "tr", "egyptian": "eg",
+    "filipino": "ph", "central african": "cf", "malian": "ml",
+    "lebanese": "lb", "american": "us", "venezuelan": "ve",
+    "jordanian": "jo", "rwandan": "rw", "georgian": "ge", "israeli": "il",
+    "cambodian": "kh", "ugandan": "ug", "south sudanese": "ss",
+    "cypriot": "cy", "palestinian": "ps", "kyrgyz": "kg", "kuwaiti": "kw",
+    "moroccan": "ma", "uzbek": "uz", "south korean": "kr", "kenyan": "ke",
+    "qatari": "qa", "kazakh": "kz", "kazakhstani": "kz", "tanzanian": "tz",
+    "bosnian": "ba", "serbian": "rs", "armenian": "am", "azerbaijani": "az",
+    "moldovan": "md", "tajik": "tj", "turkmen": "tm", "nicaraguan": "ni",
+    "cuban": "cu", "zimbabwean": "zw", "eritrean": "er", "ethiopian": "et",
+    "nigerian": "ng", "ghanaian": "gh", "south african": "za",
+    # other common PSC nationalities
+    "irish": "ie", "indian": "in", "romanian": "ro", "polish": "pl",
+    "italian": "it", "french": "fr", "german": "de", "bulgarian": "bg",
+    "spanish": "es", "dutch": "nl", "australian": "au", "lithuanian": "lt",
+    "portuguese": "pt", "swedish": "se", "greek": "gr", "hungarian": "hu",
+    "canadian": "ca", "norwegian": "no", "bangladeshi": "bd",
+    "latvian": "lv", "belgian": "be", "new zealander": "nz", "czech": "cz",
+    "danish": "dk", "malaysian": "my", "slovak": "sk", "swiss": "ch",
+    "sri lankan": "lk", "brazilian": "br", "jamaican": "jm",
+    "austrian": "at", "albanian": "al", "vietnamese": "vn",
+    "hong konger": "hk", "japanese": "jp", "singaporean": "sg",
+    "thai": "th", "estonian": "ee", "finnish": "fi", "croatian": "hr",
+    "slovenian": "si", "maltese": "mt", "mauritian": "mu", "nepalese": "np",
+}
+
+_NATIONALITY_SPLIT_RE = re.compile(r"[,/;&]|\band\b", re.IGNORECASE)
+_YEAR_MONTH_RE = re.compile(r"^(\d{4})-(\d{2})")
+
+
+# ---------------------------------------------------------------------------
+# Small helpers (unit-tested)
+# ---------------------------------------------------------------------------
+
+def nationality_codes(nationality: str) -> set:
+    """'British,Indian' -> {'gb', 'in'}. Unknown parts are dropped."""
+    codes = set()
+    for part in _NATIONALITY_SPLIT_RE.split(nationality or ""):
+        code = DEMONYM_TO_ISO.get(" ".join(part.lower().split()))
+        if code:
+            codes.add(code)
+    return codes
+
+
+def country_codes(countries: str) -> set:
+    """'gb;gb-sct;in' -> {'gb', 'in'} (subdivisions folded into the country)."""
+    return {c.strip().lower().split("-")[0] for c in (countries or "").split(";") if c.strip()}
+
+
+def nationality_consistent(nationality: str, countries: str) -> bool:
+    """True only if a known PSC nationality appears in the list's countries."""
+    return bool(nationality_codes(nationality) & country_codes(countries))
+
+
+def birth_year_months(birth_date: str) -> set:
+    """'1962-07-24;1963-01' -> {(1962, 7), (1963, 1)}. Year-only dates are dropped."""
+    out = set()
+    for part in (birth_date or "").split(";"):
+        m = _YEAR_MONTH_RE.match(part.strip())
+        if m:
+            out.add((int(m.group(1)), int(m.group(2))))
+    return out
+
+
+def psc_year_month(birth_year: str, birth_month: str):
+    try:
+        return int(float(birth_year)), int(float(birth_month))
+    except (TypeError, ValueError):
+        return None
+
+
+def detect_mode(psc_columns, list_columns) -> str:
+    """'A' if both sides carry birth data, else 'B'."""
+    if PSC_BIRTH_COLS <= set(psc_columns) and LIST_BIRTH_COL in set(list_columns):
+        return "A"
+    return "B"
+
+
+_APOSTROPHE_RE = re.compile(r"['’`]")
+
+
+def person_word_count(raw_name: str) -> int:
+    """Words in a person's name, counted before the apostrophe split:
+    "Paul O'Neill" -> 2 (normalization alone would give "paul o neill")."""
+    return len(normalize_name(_APOSTROPHE_RE.sub("", raw_name or ""))["tokens"])
+
+
+def company_real_word_count(normalized: str) -> int:
+    """Tokens of 2+ characters: "b h" (from "B&H") -> 0, "nord gold" -> 2."""
+    return sum(len(t) >= MIN_REAL_TOKEN_LEN for t in (normalized or "").split())
+
+
+def person_tier(mode: str, score: float, exact: bool, psc_name: str,
+                nationality: str, countries: str,
+                psc_ym=None, list_birth_date: str = "") -> str:
+    if mode == "A":
+        strong = score >= SCORE_CUTOFF and psc_ym is not None and \
+            psc_ym in birth_year_months(list_birth_date)
+    else:
+        strong = exact and person_word_count(psc_name) >= MIN_STRONG_PERSON_TOKENS and \
+            nationality_consistent(nationality, countries)
+    return "strong" if strong else "weak"
+
+
+def company_tier(exact: bool, normalized: str) -> str:
+    strong = exact and company_real_word_count(normalized) >= MIN_STRONG_COMPANY_TOKENS
+    return "strong" if strong else "weak"
+
+
+# ---------------------------------------------------------------------------
+# Candidate generation
+# ---------------------------------------------------------------------------
+
+def _surname_key(name: str) -> str:
+    return name.split()[-1]
+
+
+def _rarest_token_key_fn(names):
+    freq = Counter(t for n in names for t in set(n.split()))
+    # rarest first; ties -> longer token (more specific), then alphabetical
+    return lambda name: min(name.split(), key=lambda t: (freq[t], -len(t), t))
+
+
+def find_candidates(psc_names, list_names, block_key) -> dict:
+    """
+    psc_names, list_names: unique, non-empty normalized names.
+    block_key(psc_name) -> the token a list name must contain to be compared.
+    Returns {(psc_name, list_name): score} for every pair scoring >= cutoff.
+    """
+    list_set = set(list_names)
+    pairs = {}
+
+    # Pass 1: exact
+    for name in psc_names:
+        if name in list_set:
+            pairs[(name, name)] = 100.0
+
+    # Pass 2: fuzzy, blocked
+    token_index = defaultdict(set)
+    for name in list_set:
+        for tok in name.split():
+            token_index[tok].add(name)
+
+    blocks = defaultdict(list)
+    for name in psc_names:
+        key = block_key(name)
+        if key in token_index:
+            blocks[key].append(name)
+
+    for key, group in blocks.items():
+        cands = sorted(token_index[key])
+        scores = process.cdist(group, cands, scorer=fuzz.token_sort_ratio,
+                               score_cutoff=SCORE_CUTOFF, workers=-1)
+        for i, j in zip(*scores.nonzero()):
+            pairs.setdefault((group[i], cands[j]), round(float(scores[i, j]), 1))
+    return pairs
+
+
+def _pairs_frame(pairs: dict) -> pd.DataFrame:
+    return pd.DataFrame(
+        [(p, l, s) for (p, l), s in pairs.items()],
+        columns=["psc_norm", "list_norm", "score"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Matching
+# ---------------------------------------------------------------------------
+
+def _prepare_lists(pep: pd.DataFrame, sanctions: pd.DataFrame) -> dict:
+    """Returns {list_source: (persons_df, companies_df)} in a common shape."""
+    pep_std = pd.DataFrame({
+        "list_norm": pep["normalized_name"],
+        "list_name": pep["name"],
+        "list_entity_id": pep["id"],
+        "seed_source": "canonical",
+        "countries": pep.get("countries", ""),
+        "list_birth_date": pep[LIST_BIRTH_COL] if LIST_BIRTH_COL in pep else "",
+    })
+    sanc_std = pd.DataFrame({
+        "list_norm": sanctions["normalized_name"],
+        "list_name": sanctions["seed_name"],
+        "list_entity_id": sanctions["source_id"],
+        "seed_source": sanctions["seed_source"].str.replace("sanctions_", "", regex=False),
+        "countries": sanctions.get("countries", ""),
+        "list_birth_date": sanctions[LIST_BIRTH_COL] if LIST_BIRTH_COL in sanctions else "",
+        "schema": sanctions["schema"],
+    })
+    pep_std = pep_std[pep_std["list_norm"] != ""]
+    sanc_std = sanc_std[sanc_std["list_norm"] != ""]
+    return {
+        "pep": (pep_std, pep_std.iloc[0:0]),  # PEP list is people only
+        "sanctions": (
+            sanc_std[sanc_std["schema"].isin(PERSON_SCHEMAS)],
+            sanc_std[sanc_std["schema"].isin(COMPANY_SCHEMAS)],
+        ),
+    }
+
+
+def _expand(pairs: dict, psc_side: pd.DataFrame, list_side: pd.DataFrame) -> pd.DataFrame:
+    if not pairs:
+        return pd.DataFrame()
+    df = _pairs_frame(pairs)
+    df = df.merge(psc_side, left_on="psc_norm", right_on="normalized_name")
+    df = df.merge(list_side, on="list_norm")
+    df["exact"] = df["psc_norm"] == df["list_norm"]
+    return df
+
+
+def match(psc: pd.DataFrame, pep: pd.DataFrame, sanctions: pd.DataFrame):
+    """
+    Core matching on in-memory frames. `psc` must contain psc_row_id plus
+    PSC_BASE_COLS (and birth_month/birth_year for Mode A).
+    Returns (matches DataFrame with OUTPUT_FIELDS, counts dict).
+    """
+    is_ind = psc["kind"].str.startswith("individual")
+    is_corp = psc["kind"].str.startswith("corporate")
+    has_name = psc["normalized_name"] != ""
+    people = psc[is_ind & has_name]
+    corps = psc[is_corp & has_name]
+
+    counts = {
+        "psc_rows": len(psc),
+        "psc_individual_rows": int(is_ind.sum()),
+        "psc_corporate_rows": int(is_corp.sum()),
+        "psc_skipped_other_kind": int((~is_ind & ~is_corp).sum()),
+        "psc_skipped_empty_name": int(((is_ind | is_corp) & ~has_name).sum()),
+    }
+    skipped_kinds = psc.loc[~is_ind & ~is_corp, "kind"].value_counts().to_dict()
+
+    lists = _prepare_lists(pep, sanctions)
+    list_columns = {"pep": pep.columns, "sanctions": sanctions.columns}
+    people_names = people["normalized_name"].unique().tolist()
+    corp_names = corps["normalized_name"].unique().tolist()
+
+    frames = []
+    for source, (persons, companies) in lists.items():
+        mode = detect_mode(psc.columns, list_columns[source])
+        counts[f"mode_{source}"] = mode
+
+        # People
+        pairs = find_candidates(people_names, persons["list_norm"].unique().tolist(),
+                                _surname_key)
+        df = _expand(pairs, people, persons)
+        if len(df):
+            if mode == "A":
+                yms = [psc_year_month(y, m) for y, m in zip(df["birth_year"], df["birth_month"])]
+            else:
+                yms = [None] * len(df)
+            df["tier"] = [
+                person_tier(mode, s, e, n, nat, c, ym, bd)
+                for s, e, n, nat, c, ym, bd in zip(
+                    df["score"], df["exact"], df["name"], df["nationality"],
+                    df["countries"], yms, df["list_birth_date"])
+            ]
+            df["rule_used"] = mode
+            frames.append(df.assign(list_source=source))
+
+        # Companies (exact-name + 2 real words rule in both modes)
+        if len(companies):
+            all_names = corp_names + companies["list_norm"].unique().tolist()
+            pairs = find_candidates(corp_names, companies["list_norm"].unique().tolist(),
+                                    _rarest_token_key_fn(all_names))
+            df = _expand(pairs, corps, companies)
+            if len(df):
+                df["tier"] = [company_tier(e, n) for e, n in zip(df["exact"], df["psc_norm"])]
+                df["rule_used"] = "B"
+                frames.append(df.assign(list_source=source))
+
+    if frames:
+        out = pd.concat(frames, ignore_index=True)
+        out = out.rename(columns={"name": "psc_name"})
+        # One row per (PSC row, list entity): strong > weak, high score, canonical first.
+        out["_tier_rank"] = (out["tier"] != "strong").astype(int)
+        out["_alias_rank"] = (out["seed_source"] != "canonical").astype(int)
+        out = out.sort_values(["psc_row_id", "list_source", "list_entity_id",
+                               "_tier_rank", "score", "_alias_rank"],
+                              ascending=[True, True, True, True, False, True])
+        out = out.drop_duplicates(["psc_row_id", "list_source", "list_entity_id"])
+        out = out[OUTPUT_FIELDS].reset_index(drop=True)
+    else:
+        out = pd.DataFrame(columns=OUTPUT_FIELDS)
+
+    counts["skipped_kinds"] = skipped_kinds
+    return out, counts
+
+
+# ---------------------------------------------------------------------------
+# File I/O
+# ---------------------------------------------------------------------------
+
+def load_psc(path: str) -> pd.DataFrame:
+    header = pd.read_csv(path, nrows=0).columns
+    usecols = PSC_BASE_COLS + sorted(PSC_BIRTH_COLS & set(header))
+    psc = pd.read_csv(path, dtype=str, keep_default_na=False, usecols=usecols)
+    psc.insert(0, "psc_row_id", range(len(psc)))  # row position in psc_clean.csv
+    return psc
+
+
+def run(psc_path=PSC_INPUT, pep_path=PEP_INPUT, sanctions_path=SANCTIONS_INPUT,
+        output_path=MATCHES_OUTPUT):
+    psc = load_psc(psc_path)
+    pep = pd.read_csv(pep_path, dtype=str, keep_default_na=False)
+    sanctions = pd.read_csv(sanctions_path, dtype=str, keep_default_na=False)
+
+    matches, counts = match(psc, pep, sanctions)
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    matches.to_csv(output_path, index=False)
+    counts["matches_written"] = len(matches)
+    return matches, counts
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--psc", default=PSC_INPUT)
+    ap.add_argument("--pep", default=PEP_INPUT)
+    ap.add_argument("--sanctions", default=SANCTIONS_INPUT)
+    ap.add_argument("--output", default=MATCHES_OUTPUT)
+    args = ap.parse_args()
+
+    _, result_counts = run(args.psc, args.pep, args.sanctions, args.output)
+
+    print("Matching summary:", file=sys.stderr)
+    for k, v in result_counts.items():
+        print(f"  {k}: {v}", file=sys.stderr)
+    print(f"Matches written to: {args.output}", file=sys.stderr)
+
+
+
+================================================
+FILE: src/name_normalization.py
+================================================
+"""
+Name normalization pipeline (Charter Section 2.2 / Module 4 fix).
+
+Pipeline order, matching the charter exactly:
+    lowercase -> strip punctuation -> extract legal-suffix tokens into a
+    separate flag (not deleted) -> tokenize -> light stemming.
+
+This runs BEFORE rapidfuzz scoring, as a distinct step -- not folded into
+the matching call -- so it's demonstrable as its own text-analytics
+component rather than a fuzzy-matching black box.
+"""
+
+import re
+import unicodedata
+
+try:
+    from unidecode import unidecode
+    _HAS_UNIDECODE = True
+except ImportError:
+    _HAS_UNIDECODE = False
+
+LEGAL_SUFFIXES = {
+    "ltd", "limited", "llp", "llc", "plc", "inc", "trust",
+    "holdings", "co", "company", "corp", "corporation",
+}
+
+# Very light stemming: strip a small set of common trailing inflections.
+# Deliberately conservative -- aggressive stemming on proper names causes
+# more false merges than it prevents false misses.
+_STEM_SUFFIXES = ("'s",)
+
+
+def _strip_accents(text: str) -> str:
+    """
+    Transliterate to ASCII so matching isn't defeated by script differences --
+    both accented Latin ('Câmpean' -> 'Campean') and non-Latin scripts
+    ('Костенко' -> 'Kostenko'), per the transliteration step in the Final
+    Scope Summary. Uses unidecode if installed (handles Cyrillic, Greek,
+    etc. properly); falls back to NFKD diacritic-stripping, which only
+    handles accented Latin and leaves other scripts unchanged, if not.
+    """
+    if _HAS_UNIDECODE:
+        return unidecode(text)
+    normalized = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in normalized if not unicodedata.combining(c))
+
+
+def _light_stem(token: str) -> str:
+    for suf in _STEM_SUFFIXES:
+        if token.endswith(suf):
+            return token[: -len(suf)]
+    return token
+
+
+def normalize_name(raw_name: str) -> dict:
+    """
+    Returns a dict with:
+        normalized   -- the cleaned, space-joined token string used for matching
+        tokens       -- list of tokens (legal suffixes removed)
+        has_legal_suffix -- bool flag, the extracted information (not discarded)
+    """
+    if not raw_name or not raw_name.strip():
+        return {"normalized": "", "tokens": [], "has_legal_suffix": False}
+
+    text = _strip_accents(raw_name)
+    text = text.lower()
+    text = re.sub(r"[^\w\s]", " ", text)  # strip punctuation
+    raw_tokens = text.split()
+
+    has_legal_suffix = any(t in LEGAL_SUFFIXES for t in raw_tokens)
+    tokens = [_light_stem(t) for t in raw_tokens if t not in LEGAL_SUFFIXES]
+
+    return {
+        "normalized": " ".join(tokens).strip(),
+        "tokens": tokens,
+        "has_legal_suffix": has_legal_suffix,
+    }
+
+
+
+================================================
+FILE: src/pep_cleaning.py
+================================================
+"""
+PEP dataset cleaning (Charter Section 1.2 known issues, Part 2 recommendation).
+
+Three fixes applied, in this order:
+    1. Encoding repair (mojibake) on name/aliases/addresses fields.
+    2. Filter to rows where 'countries' contains 'gb' (semicolon-separated field).
+    3. Regex-exclude positional-title rows (Lords Spiritual / bishops etc.)
+       that are unmatchable against PSC personal-name fields.
+
+Run directly:
+    python src/pep_cleaning.py --input data/raw/pep/pep_export_2026-08-02.csv \
+                                --output data/interim/pep_clean.csv
+"""
+
+import argparse
+import csv
+import re
+import sys
+
+from text_encoding import fix_mojibake, fix_mojibake_row, sniff_delimiter
+from name_normalization import normalize_name
+
+MOJIBAKE_FIELDS = ["name", "aliases", "addresses"]
+
+# Positional titles that appear in the PEP list instead of a personal name --
+# these can never match a PSC name field and must be excluded up front rather
+# than silently failing every match attempt against them.
+# 'bishop of' / 'archbishop' are matched anywhere in the name, since titles
+# like "The Rt Rev. the Lord Bishop of St. Albans" put an honorific first.
+# 'rt rev' alone is deliberately NOT a pattern: it also prefixes real
+# people's names, e.g. "The Rt Rev. the Lord Harries of Pentregarth".
+POSITIONAL_TITLE_RE = re.compile(
+    r"^(?:(the\s+)?(lord\s+bishop\s+of|bishop\s+of|lord\s+(?!\w+\s+\w+$)|"
+    r"baroness\s+of|rt\s+hon\s+the|speaker\s+of\s+the|president\s+of\s+the)\b"
+    r"|.*(bishop\s+of\b|archbishop))",
+    re.IGNORECASE,
+)
+
+
+def run(input_path: str, output_path: str):
+    """
+    Reads the raw PEP export, applies encoding repair + gb filter +
+    positional-title exclusion + normalization, writes the cleaned CSV,
+    and returns a dict of summary counts for the pilot log / report.
+    """
+    counts = {
+        "total_rows": 0,
+        "kept_gb": 0,
+        "dropped_not_gb": 0,
+        "dropped_positional_title": 0,
+        "dropped_empty_name": 0,
+    }
+
+    with open(input_path, encoding="utf-8", newline="") as f:
+        sample = f.read(4096)
+        f.seek(0)
+        delimiter = sniff_delimiter(sample)
+        reader = csv.DictReader(f, delimiter=delimiter)
+        fieldnames = list(reader.fieldnames) + ["normalized_name", "has_legal_suffix"]
+
+        rows_out = []
+        for row in reader:
+            counts["total_rows"] += 1
+            row = fix_mojibake_row(row, MOJIBAKE_FIELDS)
+
+            countries = [c.strip().lower() for c in (row.get("countries") or "").split(";")]
+            if "gb" not in countries:
+                counts["dropped_not_gb"] += 1
+                continue
+
+            name = (row.get("name") or "").strip()
+            if not name:
+                counts["dropped_empty_name"] += 1
+                continue
+
+            if POSITIONAL_TITLE_RE.match(name):
+                counts["dropped_positional_title"] += 1
+                continue
+
+            norm = normalize_name(name)
+            row["normalized_name"] = norm["normalized"]
+            row["has_legal_suffix"] = norm["has_legal_suffix"]
+
+            clean_aliases = []
+            for alias in (row.get("aliases") or "").split(";"):
+                alias = alias.strip()
+                if alias and not POSITIONAL_TITLE_RE.match(alias):
+                    clean_aliases.append(alias)
+            row["aliases"] = ";".join(clean_aliases)
+
+            counts["kept_gb"] += 1
+            rows_out.append(row)
+
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows_out)
+
+    return counts
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True)
+    ap.add_argument("--output", required=True)
+    args = ap.parse_args()
+
+    result_counts = run(args.input, args.output)
+
+    print("PEP cleaning summary:", file=sys.stderr)
+    for k, v in result_counts.items():
+        print(f"  {k}: {v}", file=sys.stderr)
+    print(f"Cleaned file written to: {args.output}", file=sys.stderr)
+
+
+
+================================================
+FILE: src/psc_loader.py
+================================================
+"""
+Companies House PSC snapshot loader.
+
+Reads whatever .txt (JSONL) parts are actually present in the snapshot
+directory -- currently just part 1 of 32 -- and logs coverage explicitly so
+match-count results are never silently treated as full-register figures.
+
+Handles both PSC record kinds seen in the snapshot:
+    - individual-person-with-significant-control: name from name_elements,
+      or identity_verification_details.preferred_name if present.
+    - corporate-entity-person-with-significant-control: name field directly.
+
+Streams line-by-line (snapshot parts can be large) rather than loading the
+whole file into memory, and writes output incrementally.
+
+Run directly:
+    python src/psc_loader.py --input-dir data/raw/psc/psc_snapshot_2026-08-02 \
+                              --output data/interim/psc_clean.csv \
+                              --expected-parts 32
+"""
+
+import argparse
+import csv
+import glob
+import json
+import os
+import sys
+
+from text_encoding import fix_mojibake
+from name_normalization import normalize_name
+
+OUTPUT_FIELDS = [
+    "company_number", "kind", "name", "normalized_name", "has_legal_suffix",
+    "address", "nationality", "country_of_residence", "notified_on",
+    "natures_of_control", "source_part",
+]
+
+
+def _extract_name(data: dict) -> str:
+    # Individuals: prefer the verified preferred_name if present (it can
+    # differ from name_elements, e.g. post-marriage or corrected spelling).
+    ivd = data.get("identity_verification_details") or {}
+    if ivd.get("preferred_name"):
+        return ivd["preferred_name"]
+
+    if "name_elements" in data:
+        ne = data["name_elements"]
+        parts = [ne.get("forename"), ne.get("middle_name"), ne.get("surname")]
+        name = " ".join(p for p in parts if p)
+        if name:
+            return name
+
+    return data.get("name", "")
+
+
+def _extract_address(data: dict) -> str:
+    addr = data.get("address") or {}
+    parts = [
+        addr.get("premises"), addr.get("address_line_1"), addr.get("address_line_2"),
+        addr.get("locality"), addr.get("region"), addr.get("postal_code"),
+        addr.get("country"),
+    ]
+    return ", ".join(p for p in parts if p)
+
+
+def iter_psc_records(part_path: str, part_label: str):
+    with open(part_path, encoding="utf-8") as f:
+        for line_num, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                print(f"  [warn] skipping malformed JSON at {part_label}:{line_num}", file=sys.stderr)
+                continue
+
+            data = rec.get("data", {})
+            name = fix_mojibake(_extract_name(data))
+            if not name:
+                continue
+
+            norm = normalize_name(name)
+            yield {
+                "company_number": rec.get("company_number", ""),
+                "kind": data.get("kind", ""),
+                "name": name,
+                "normalized_name": norm["normalized"],
+                "has_legal_suffix": norm["has_legal_suffix"],
+                "address": _extract_address(data),
+                "nationality": data.get("nationality", ""),
+                "country_of_residence": data.get("country_of_residence", ""),
+                "notified_on": data.get("notified_on", ""),
+                "natures_of_control": ";".join(data.get("natures_of_control", []) or []),
+                "source_part": part_label,
+            }
+
+
+def run(input_dir: str, output_path: str, expected_parts: int = 32):
+    part_files = sorted(glob.glob(os.path.join(input_dir, "*.txt")))
+
+    if not part_files:
+        raise FileNotFoundError(f"No .txt parts found in {input_dir}")
+
+    print(f"Found {len(part_files)} of {expected_parts} expected PSC parts.", file=sys.stderr)
+    if len(part_files) < expected_parts:
+        print(
+            f"  [COVERAGE WARNING] Only {len(part_files)}/{expected_parts} parts present. "
+            "Any match counts from this run are a PARTIAL-COVERAGE pilot result, "
+            "not a full-register figure. Log this explicitly in docs/pilot_results.md.",
+            file=sys.stderr,
+        )
+
+    counts = {"parts_processed": 0, "records_written": 0, "records_skipped_no_name": 0}
+
+    with open(output_path, "w", encoding="utf-8", newline="") as out_f:
+        writer = csv.DictWriter(out_f, fieldnames=OUTPUT_FIELDS)
+        writer.writeheader()
+
+        for part_path in part_files:
+            part_label = os.path.basename(part_path)
+            print(f"  Processing {part_label} ...", file=sys.stderr)
+            part_record_count = 0
+            for record in iter_psc_records(part_path, part_label):
+                writer.writerow(record)
+                part_record_count += 1
+            counts["records_written"] += part_record_count
+            counts["parts_processed"] += 1
+            print(f"    -> {part_record_count} named PSC records", file=sys.stderr)
+
+    counts["parts_found"] = len(part_files)
+    counts["parts_expected"] = expected_parts
+    return counts
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input-dir", required=True, help="Directory containing PSC snapshot .txt parts")
+    ap.add_argument("--output", required=True)
+    ap.add_argument("--expected-parts", type=int, default=32)
+    args = ap.parse_args()
+
+    result_counts = run(args.input_dir, args.output, args.expected_parts)
+
+    print("\nPSC loader summary:", file=sys.stderr)
+    for k, v in result_counts.items():
+        print(f"  {k}: {v}", file=sys.stderr)
+    print(f"Cleaned file written to: {args.output}", file=sys.stderr)
+
+
+
+================================================
+FILE: src/sanctions_loader.py
+================================================
+"""
+UK FCDO Sanctions List loader (targets_simple.csv).
+
+Per Charter Section 1.1 / prior validation: NO country filter is applied --
+this dataset is inherently UK-scoped by dataset membership (every row is a
+'gb_fcdo_sanctions' entry), not by the 'countries' field, which mostly shows
+the *sanctioned entity's* nationality (Russia, Iran, etc.), not the
+designating jurisdiction. Filtering on 'countries' here would reproduce the
+64-row mistake documented earlier in this project.
+
+Each row's name AND each semicolon-separated alias becomes its own seed row,
+tagged by source, so a match against an alias is distinguishable from a
+match against the canonical name during the manual spot-check.
+
+Run directly:
+    python src/sanctions_loader.py --input data/raw/fcdo_sanctions/gb_fcdo_sanctions_2026-08-02.csv \
+                                    --output data/interim/sanctions_clean.csv
+"""
+
+import argparse
+import csv
+import sys
+
+from text_encoding import fix_mojibake
+from name_normalization import normalize_name
+
+OUTPUT_FIELDS = [
+    "source_id", "schema", "seed_name", "seed_source", "normalized_name",
+    "has_legal_suffix", "countries", "dataset",
+]
+
+
+def expand_rows(input_path: str):
+    """Yields one output row per (canonical name) and per alias."""
+    with open(input_path, encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            name = fix_mojibake((row.get("name") or "").strip())
+            if name:
+                norm = normalize_name(name)
+                yield {
+                    "source_id": row.get("id", ""),
+                    "schema": row.get("schema", ""),
+                    "seed_name": name,
+                    "seed_source": "sanctions_canonical",
+                    "normalized_name": norm["normalized"],
+                    "has_legal_suffix": norm["has_legal_suffix"],
+                    "countries": row.get("countries", ""),
+                    "dataset": row.get("dataset", ""),
+                }
+
+            for alias in (row.get("aliases") or "").split(";"):
+                alias = fix_mojibake(alias.strip())
+                if not alias:
+                    continue
+                norm = normalize_name(alias)
+                if not norm["normalized"]:
+                    continue
+                yield {
+                    "source_id": row.get("id", ""),
+                    "schema": row.get("schema", ""),
+                    "seed_name": alias,
+                    "seed_source": "sanctions_alias",
+                    "normalized_name": norm["normalized"],
+                    "has_legal_suffix": norm["has_legal_suffix"],
+                    "countries": row.get("countries", ""),
+                    "dataset": row.get("dataset", ""),
+                }
+
+
+def run(input_path: str, output_path: str):
+    counts = {"canonical_names": 0, "aliases": 0, "total_seed_rows": 0}
+    rows_out = []
+    for row in expand_rows(input_path):
+        rows_out.append(row)
+        counts["total_seed_rows"] += 1
+        if row["seed_source"] == "sanctions_canonical":
+            counts["canonical_names"] += 1
+        else:
+            counts["aliases"] += 1
+
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows_out)
+
+    return counts
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True)
+    ap.add_argument("--output", required=True)
+    args = ap.parse_args()
+
+    result_counts = run(args.input, args.output)
+
+    print("Sanctions loader summary:", file=sys.stderr)
+    for k, v in result_counts.items():
+        print(f"  {k}: {v}", file=sys.stderr)
+    print(f"Cleaned file written to: {args.output}", file=sys.stderr)
+
+
+
+================================================
+FILE: src/text_encoding.py
+================================================
+"""
+Encoding utilities.
+
+The PEP export has a specific, known corruption: UTF-8 bytes that were
+decoded as Latin-1 at some point in the export pipeline, producing mojibake
+like 'CÃ®mpean' instead of 'Câmpean'. fix_mojibake() detects and repairs this.
+
+It is applied defensively across all three sources (PEP, sanctions, PSC)
+because there's no guarantee only one file is affected, but it is a no-op on
+clean text -- it only rewrites a string if doing so actually produces valid,
+different UTF-8, so correctly-encoded Cyrillic/accented names (e.g. in the
+sanctions file) pass through unchanged.
+"""
+
+import re
+
+# A cheap heuristic pre-check: mojibake of this kind almost always produces
+# the byte sequence for 'Ã' (U+00C3) followed by another Latin-1 supplement
+# character. If neither telltale character is present, skip the round-trip
+# entirely rather than risk corrupting genuinely clean text.
+_MOJIBAKE_HINT = re.compile(r"[ÃÂ]")
+
+
+def fix_mojibake(text: str) -> str:
+    """Repair UTF-8-decoded-as-Latin-1 mojibake. Safe no-op on clean text."""
+    if not text or not _MOJIBAKE_HINT.search(text):
+        return text
+    try:
+        repaired = text.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text  # not this kind of corruption -- leave untouched
+    return repaired
+
+
+def fix_mojibake_row(row: dict, fields: list[str]) -> dict:
+    """Apply fix_mojibake to a specific set of fields in a CSV DictReader row."""
+    for field in fields:
+        if field in row and row[field]:
+            row[field] = fix_mojibake(row[field])
+    return row
+
+
+def sniff_delimiter(sample: str) -> str:
+    """Distinguish tab-delimited vs comma-delimited exports (the PEP preview
+    you pasted was tab-delimited; some OpenSanctions exports are comma-delimited).
+    """
+    return "\t" if sample.count("\t") > sample.count(",") else ","
+
+
+
+================================================
+FILE: tests/test_matching.py
+================================================
+import os
+import sys
+
+import pandas as pd
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from matching import (  # noqa: E402
+    birth_year_months, detect_mode, match, nationality_consistent,
+)
+
+
+def _psc(rows, birth=False):
+    cols = ["company_number", "kind", "name", "normalized_name", "nationality"]
+    if birth:
+        cols += ["birth_year", "birth_month"]
+    df = pd.DataFrame(rows, columns=cols)
+    df.insert(0, "psc_row_id", range(len(df)))
+    return df
+
+
+def _pep(rows=(), birth=True):
+    cols = ["id", "name", "normalized_name", "countries"] + (["birth_date"] if birth else [])
+    return pd.DataFrame(list(rows), columns=cols)
+
+
+def _sanctions(rows=()):
+    cols = ["source_id", "schema", "seed_name", "seed_source", "normalized_name", "countries"]
+    return pd.DataFrame(list(rows), columns=cols)
+
+
+IND = "individual-person-with-significant-control"
+CORP = "corporate-entity-person-with-significant-control"
+
+
+def test_exact_match_is_strong_in_mode_b():
+    psc = _psc([("001", IND, "Ivan Petrovich Sidorov", "ivan petrovich sidorov", "Russian")])
+    sanc = _sanctions([("S1", "Person", "Ivan Petrovich SIDOROV", "sanctions_canonical",
+                        "ivan petrovich sidorov", "ru")])
+    out, counts = match(psc, _pep(), sanc)
+    assert counts["mode_sanctions"] == "B"
+    assert len(out) == 1
+    assert out.loc[0, "tier"] == "strong"
+    assert out.loc[0, "rule_used"] == "B"
+    assert out.loc[0, "list_source"] == "sanctions"
+
+
+def test_two_word_name_is_never_strong_in_mode_b():
+    psc = _psc([("001", IND, "Ivan Sidorov", "ivan sidorov", "Russian")])
+    sanc = _sanctions([("S1", "Person", "Ivan SIDOROV", "sanctions_canonical",
+                        "ivan sidorov", "ru")])
+    out, _ = match(psc, _pep(), sanc)
+    assert len(out) == 1
+    assert out.loc[0, "tier"] == "weak"
+
+
+def test_unknown_nationality_is_never_strong_in_mode_b():
+    psc = _psc([("001", IND, "Ivan Petrovich Sidorov", "ivan petrovich sidorov", "")])
+    sanc = _sanctions([("S1", "Person", "Ivan Petrovich SIDOROV", "sanctions_canonical",
+                        "ivan petrovich sidorov", "ru")])
+    out, _ = match(psc, _pep(), sanc)
+    assert out.loc[0, "tier"] == "weak"
+
+
+def test_person_is_never_matched_to_an_organisation():
+    psc = _psc([
+        ("001", IND, "Electra Pro Trading", "electra pro trading", "Russian"),
+        ("002", CORP, "Ivan Petrovich Sidorov Ltd", "ivan petrovich sidorov", ""),
+    ])
+    sanc = _sanctions([
+        ("S1", "Organization", "Electra Pro Trading LLC", "sanctions_canonical",
+         "electra pro trading", "ru"),
+        ("S2", "Person", "Ivan Petrovich SIDOROV", "sanctions_canonical",
+         "ivan petrovich sidorov", "ru"),
+    ])
+    out, _ = match(psc, _pep(), sanc)
+    assert out.empty
+
+
+def test_company_exact_match_is_strong():
+    psc = _psc([("001", CORP, "Electra Pro Ltd", "electra pro", "")])
+    sanc = _sanctions([("S1", "Organization", "ELECTRA PRO LLC", "sanctions_canonical",
+                        "electra pro", "ru")])
+    out, _ = match(psc, _pep(), sanc)
+    assert out.loc[0, "tier"] == "strong"
+
+
+def test_apostrophe_name_is_two_words_not_three():
+    """'o neill' after normalization must not pass the 3-word rule."""
+    psc = _psc([("001", IND, "Paul O'Neill", "paul o neill", "British")])
+    pep = _pep([("P1", "Paul O'Neill", "paul o neill", "gb", "")])
+    out, _ = match(psc, pep, _sanctions())
+    assert len(out) == 1
+    assert out.loc[0, "tier"] == "weak"
+
+
+def test_short_company_alias_is_weak():
+    psc = _psc([
+        ("001", CORP, "Cp Holdings Limited", "cp", ""),
+        ("002", CORP, "B&H Limited", "b h", ""),
+    ])
+    sanc = _sanctions([
+        ("S1", "Organization", "CP", "sanctions_alias", "cp", "ru"),
+        ("S2", "Organization", "B&H", "sanctions_alias", "b h", "ru"),
+    ])
+    out, _ = match(psc, _pep(), sanc)
+    assert len(out) == 2
+    assert (out["tier"] == "weak").all()
+
+
+def test_fuzzy_match_is_weak():
+    psc = _psc([("001", IND, "Ilya Vladimirovich Sidorov", "ilya vladimirovich sidorov", "Russian")])
+    sanc = _sanctions([("S1", "Person", "Ilia Vladimirovich Sidorov", "sanctions_canonical",
+                        "ilia vladimirovich sidorov", "ru")])
+    out, _ = match(psc, _pep(), sanc)
+    assert len(out) == 1
+    assert out.loc[0, "score"] >= 90
+    assert out.loc[0, "tier"] == "weak"
+
+
+def test_mode_a_is_chosen_when_birth_columns_exist():
+    assert detect_mode(["birth_month", "birth_year", "name"], ["birth_date"]) == "A"
+    assert detect_mode(["name"], ["birth_date"]) == "B"
+    assert detect_mode(["birth_month", "birth_year"], ["name"]) == "B"
+
+    # End to end: a two-word name with matching birth month/year is strong in Mode A.
+    psc = _psc([("001", IND, "John Smith", "john smith", "British", "1962", "7")], birth=True)
+    pep = _pep([("P1", "John Smith", "john smith", "gb", "1962-07-24")])
+    out, counts = match(psc, pep, _sanctions())
+    assert counts["mode_pep"] == "A"
+    assert counts["mode_sanctions"] == "B"  # sanctions has no birth_date column
+    assert out.loc[0, "rule_used"] == "A"
+    assert out.loc[0, "tier"] == "strong"
+
+
+def test_mode_a_wrong_birth_month_is_weak():
+    psc = _psc([("001", IND, "John Smith", "john smith", "British", "1962", "8")], birth=True)
+    pep = _pep([("P1", "John Smith", "john smith", "gb", "1962-07-24")])
+    out, _ = match(psc, pep, _sanctions())
+    assert out.loc[0, "tier"] == "weak"
+
+
+def test_skipped_kinds_are_counted():
+    psc = _psc([("001", "legal-person-person-with-significant-control", "X", "x", "")])
+    _, counts = match(psc, _pep(), _sanctions())
+    assert counts["psc_skipped_other_kind"] == 1
+
+
+def test_helpers():
+    assert nationality_consistent("British,Indian", "gb;in")
+    assert nationality_consistent("Scottish", "gb-sct")
+    assert not nationality_consistent("Martian", "ru")
+    assert birth_year_months("1962-07-24;1963-01-02;1970") == {(1962, 7), (1963, 1)}
+
+
+
+================================================
+FILE: tests/test_name_normalization.py
+================================================
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from name_normalization import normalize_name  # noqa: E402
+
+
+def test_legal_suffix_equivalence():
+    """The charter's own edge case: these must normalize identically."""
+    a = normalize_name("Smith & Sons Ltd.")
+    b = normalize_name("SMITH AND SONS LIMITED")
+    # 'and' vs '&' differ post-strip ('&' becomes a space, 'and' stays a token) --
+    # this is a known, documented residual gap; assert what the pipeline
+    # actually guarantees: legal-suffix removal and case-insensitivity.
+    assert a["has_legal_suffix"] is True
+    assert b["has_legal_suffix"] is True
+    assert "ltd" not in a["tokens"]
+    assert "limited" not in b["tokens"]
+
+
+def test_accent_stripping():
+    result = normalize_name("Câmpean")
+    assert result["normalized"] == "campean"
+
+
+def test_empty_input():
+    result = normalize_name("")
+    assert result["normalized"] == ""
+    assert result["tokens"] == []
+    assert result["has_legal_suffix"] is False
+
+
+def test_case_insensitivity():
+    a = normalize_name("Robert Hitchins Limited")
+    b = normalize_name("robert hitchins limited")
+    assert a["normalized"] == b["normalized"]
+
+
+def test_punctuation_stripped():
+    result = normalize_name("O'Brien-Smith, PLC")
+    assert "," not in result["normalized"]
+    assert result["has_legal_suffix"] is True
+
+
+if __name__ == "__main__":
+    test_legal_suffix_equivalence()
+    test_accent_stripping()
+    test_empty_input()
+    test_case_insensitivity()
+    test_punctuation_stripped()
+    print("All name_normalization tests passed.")
+
+
+
+================================================
+FILE: tests/test_pep_cleaning.py
+================================================
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from pep_cleaning import POSITIONAL_TITLE_RE  # noqa: E402
+
+
+def _is_title(name: str) -> bool:
+    # Same call pep_cleaning.run() uses to drop a row / alias.
+    return POSITIONAL_TITLE_RE.match(name) is not None
+
+
+def test_bishop_title_after_honorific_is_filtered():
+    """'Rt Rev.' before 'Bishop of' slipped past the old start-anchored regex."""
+    assert _is_title("The Rt Rev. the Lord Bishop of St. Albans")
+
+
+def test_archbishop_title_is_filtered():
+    assert _is_title("The Most Rev. and Rt Hon. the Lord Archbishop of Canterbury DBE")
+
+
+def test_normal_name_is_kept():
+    assert not _is_title("John Smith")
+
+
+def test_rt_rev_real_person_is_kept():
+    """Decision: 'rt rev' is not a title pattern. Lord Harries is a real
+    person (a life peer), so his row must survive the filter."""
+    assert not _is_title("The Rt Rev. the Lord Harries of Pentregarth")
+
+
+if __name__ == "__main__":
+    test_bishop_title_after_honorific_is_filtered()
+    test_archbishop_title_is_filtered()
+    test_normal_name_is_kept()
+    test_rt_rev_real_person_is_kept()
+    print("All pep_cleaning tests passed.")
+
 

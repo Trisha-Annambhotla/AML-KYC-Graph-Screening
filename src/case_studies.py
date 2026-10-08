@@ -240,8 +240,9 @@ def draw_case(graph, df_by_node, center, radius, title, path, important, extra_l
     """address_nodes: (label, [psc nodes]) pairs drawn as grey squares, dashed."""
     nodes, edges, more = neighbourhood(graph, center, radius, important)
     g = nx.Graph()
-    g.add_nodes_from(nodes)
-    g.add_edges_from(edges)
+    # sorted: set order varies between runs, and spring_layout depends on it
+    g.add_nodes_from(sorted(nodes))
+    g.add_edges_from(sorted(edges))
     for sid, (parent, _) in more.items():
         g.add_edge(sid, parent)
     for i, (_, pscs) in enumerate(address_nodes):

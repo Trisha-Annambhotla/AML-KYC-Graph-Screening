@@ -1,7 +1,9 @@
 Directory structure:
-└── AML-KYC-Graph-Screening/
+└── KYC/
     ├── README.md
     ├── requirements.txt
+    ├── data/
+    │   └── README.md
     ├── docs/
     │   ├── implementation_plan.md
     │   └── preprocessing_log.md
@@ -42,6 +44,54 @@ unidecode>=1.3
 
 
 ================================================
+FILE: data/README.md
+================================================
+# Data Provenance
+
+Raw data is not committed to this repository (see .gitignore). This file is
+the record of what was used, where it came from, and when â€” per the
+point-in-time snapshot policy (Charter Section 1.4). No re-pulls mid-project.
+
+## 1. UK FCDO Sanctions List
+
+- Source: OpenSanctions, `gb_fcdo_sanctions` dataset
+- URL: https://www.opensanctions.org/datasets/gb_fcdo_sanctions/
+- Downloaded: 2026-08-02
+- Local file: `data/raw/fcdo_sanctions/fcdo.csv`
+- Row count: 6,261
+- License: OpenSanctions â€” free for non-commercial use
+- SHA256: <paste output of `sha256sum` / `Get-FileHash` here>
+
+## 2. PEP Dataset
+
+- Source: OpenSanctions, PEP dataset
+- URL: https://www.opensanctions.org/datasets/peps/
+- Downloaded: 2026-08-02
+- Local file: `data/raw/pep/pep.csv`
+- Row count (pre-filter): <fill in>
+- Row count (post `contains gb` filter, applied in code not at source): <fill in>
+- Known issue: raw export has UTF-8-as-Latin-1 mojibake in non-ASCII names â€”
+  fixed in `src/pep_cleaning.py`, not at the source file.
+- License: OpenSanctions â€” free for non-commercial use
+- SHA256: <paste hash here>
+
+## 3. UK Companies House PSC Snapshot
+
+- Source: Companies House bulk PSC snapshot
+- URL: http://download.companieshouse.gov.uk/en_pscdata.html
+- Snapshot date: 2026-08-02
+- Local files: `data/raw/psc/psc-snapshot-2026-08-02_1of32.txt/` (32 parts, JSONL/.txt)
+- Format: one JSON object per line
+- License: Open Government Licence
+- SHA256 (per part): <paste hashes here, or a manifest file if easier>
+
+## Policy
+
+- Single fixed download date per source, logged above. No mid-project re-pulls.
+- Any dataset added later must get its own dated entry here before use.
+
+
+================================================
 FILE: docs/implementation_plan.md
 ================================================
 Below is the full plan. Save it in your repo as **`docs/implementation_plan.md`**. Then, for each phase, tell Claude Code: *"Implement Phase N of docs/implementation_plan.md. Follow the rules in the 'Rules for every phase' section."* Do one phase per session, and paste each checkpoint result here if you want a second opinion.
@@ -64,7 +114,7 @@ Below is the full plan. Save it in your repo as **`docs/implementation_plan.md`*
 1. Never read a full CSV into the conversation. Inspect files with pandas `nrows=` or `head`.
 2. Never modify anything in `data/interim/`.
 3. Large outputs go in `data/processed/`, which git ignores. Small results (metrics CSVs, charts, markdown summaries) go in `results/` or `docs/` and are committed.
-4. Each phase is one module in `src/`, with tests in `tests/`. Also add the phase as a step in `scripts/run_pipeline.py`, so the whole pipeline (Phases 1–4) can be rerun with one command when new data arrives.
+4. Each phase is one module in `src/`, with tests in `tests/`. Also add the phase as a step in `scripts/run_pipeline.py`, so the whole pipeline (Phases 1â€“4) can be rerun with one command when new data arrives.
 5. Set `random_state=42` everywhere randomness is used.
 6. At every **checkpoint**, show the summary and wait for approval before continuing.
 7. At the end of every phase, run all tests, then run:
@@ -89,11 +139,11 @@ Below is the full plan. Save it in your repo as **`docs/implementation_plan.md`*
    * Then do a fuzzy pass with blocking. For people, only compare names with the same last word (surname). For companies, only compare names sharing their least common word.
 4. **Scoring:** use rapidfuzz `token_sort_ratio` on `normalized_name`, and keep candidates scoring at least 90.
 5. **Strong vs weak.** Detect which mode applies from the columns present.
-   * **Mode A (birth dates available):** the PSC file has `birth_month`/`birth_year` and the list row has `birth_date`. Strong means score ≥ 90 and the same birth year and month. Sanctions `birth_date` may hold several dates separated by `;`, and any one matching counts.
+   * **Mode A (birth dates available):** the PSC file has `birth_month`/`birth_year` and the list row has `birth_date`. Strong means score â‰¥ 90 and the same birth year and month. Sanctions `birth_date` may hold several dates separated by `;`, and any one matching counts.
    * **Mode B (current files, fallback rule):**
-     * *People:* strong means an exact normalised name match, at least 3 name words, and a nationality consistent with the list's `countries`. Use a small mapping, such as British → gb, Russian → ru, Iranian → ir. An unknown or missing nationality is never strong.
+     * *People:* strong means an exact normalised name match, at least 3 name words, and a nationality consistent with the list's `countries`. Use a small mapping, such as British â†’ gb, Russian â†’ ru, Iranian â†’ ir. An unknown or missing nationality is never strong.
      * *Companies:* strong means an exact normalised name match.
-   * Everything else scoring ≥ 90 is weak.
+   * Everything else scoring â‰¥ 90 is weak.
    * Record in a `rule_used` column whether Mode A or B produced each label.
 6. **Output columns:** `psc_row_id`, `company_number`, `kind`, `psc_name`, `nationality`, `list_name`, `list_source` (pep or sanctions), `seed_source` (canonical or alias, for sanctions), `list_entity_id`, `score`, `tier`, `rule_used`.
 7. **Tests:**
@@ -193,7 +243,7 @@ Below is the full plan. Save it in your repo as **`docs/implementation_plan.md`*
    * (a) random scores
    * (b) a simple rule: rank by `flagged_neighbour_companies`, then by `shared_address_count`
 5. **Metrics:**
-   * **Main:** PR-AUC (`average_precision_score`), reported as the mean ± std across folds, plus Precision@50 and Precision@100 on the pooled out-of-fold scores.
+   * **Main:** PR-AUC (`average_precision_score`), reported as the mean Â± std across folds, plus Precision@50 and Precision@100 on the pooled out-of-fold scores.
    * **Also:** recall at k.
    * **Secondary:** ROC-AUC.
    * **Context only:** accuracy at a 0.5 threshold.
@@ -248,7 +298,7 @@ Below is the full plan. Save it in your repo as **`docs/implementation_plan.md`*
 ================================================
 FILE: docs/preprocessing_log.md
 ================================================
-# Preprocessing Log — 2026-09-09 12:53
+# Preprocessing Log â€” 2026-09-09 12:53
 
 ## Sanctions (gb_fcdo_sanctions)
 
@@ -363,7 +413,7 @@ def main():
     os.makedirs(DOCS, exist_ok=True)
 
     log_lines = [
-        f"# Preprocessing Log — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"# Preprocessing Log â€” {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         "",
     ]
 
@@ -593,7 +643,7 @@ def detect_mode(psc_columns, list_columns) -> str:
     return "B"
 
 
-_APOSTROPHE_RE = re.compile(r"['’`]")
+_APOSTROPHE_RE = re.compile(r"['â€™`]")
 
 
 def person_word_count(raw_name: str) -> int:
@@ -848,84 +898,7 @@ if __name__ == "__main__":
 ================================================
 FILE: src/name_normalization.py
 ================================================
-"""
-Name normalization pipeline (Charter Section 2.2 / Module 4 fix).
-
-Pipeline order, matching the charter exactly:
-    lowercase -> strip punctuation -> extract legal-suffix tokens into a
-    separate flag (not deleted) -> tokenize -> light stemming.
-
-This runs BEFORE rapidfuzz scoring, as a distinct step -- not folded into
-the matching call -- so it's demonstrable as its own text-analytics
-component rather than a fuzzy-matching black box.
-"""
-
-import re
-import unicodedata
-
-try:
-    from unidecode import unidecode
-    _HAS_UNIDECODE = True
-except ImportError:
-    _HAS_UNIDECODE = False
-
-LEGAL_SUFFIXES = {
-    "ltd", "limited", "llp", "llc", "plc", "inc", "trust",
-    "holdings", "co", "company", "corp", "corporation",
-}
-
-# Very light stemming: strip a small set of common trailing inflections.
-# Deliberately conservative -- aggressive stemming on proper names causes
-# more false merges than it prevents false misses.
-_STEM_SUFFIXES = ("'s",)
-
-
-def _strip_accents(text: str) -> str:
-    """
-    Transliterate to ASCII so matching isn't defeated by script differences --
-    both accented Latin ('Câmpean' -> 'Campean') and non-Latin scripts
-    ('Костенко' -> 'Kostenko'), per the transliteration step in the Final
-    Scope Summary. Uses unidecode if installed (handles Cyrillic, Greek,
-    etc. properly); falls back to NFKD diacritic-stripping, which only
-    handles accented Latin and leaves other scripts unchanged, if not.
-    """
-    if _HAS_UNIDECODE:
-        return unidecode(text)
-    normalized = unicodedata.normalize("NFKD", text)
-    return "".join(c for c in normalized if not unicodedata.combining(c))
-
-
-def _light_stem(token: str) -> str:
-    for suf in _STEM_SUFFIXES:
-        if token.endswith(suf):
-            return token[: -len(suf)]
-    return token
-
-
-def normalize_name(raw_name: str) -> dict:
-    """
-    Returns a dict with:
-        normalized   -- the cleaned, space-joined token string used for matching
-        tokens       -- list of tokens (legal suffixes removed)
-        has_legal_suffix -- bool flag, the extracted information (not discarded)
-    """
-    if not raw_name or not raw_name.strip():
-        return {"normalized": "", "tokens": [], "has_legal_suffix": False}
-
-    text = _strip_accents(raw_name)
-    text = text.lower()
-    text = re.sub(r"[^\w\s]", " ", text)  # strip punctuation
-    raw_tokens = text.split()
-
-    has_legal_suffix = any(t in LEGAL_SUFFIXES for t in raw_tokens)
-    tokens = [_light_stem(t) for t in raw_tokens if t not in LEGAL_SUFFIXES]
-
-    return {
-        "normalized": " ".join(tokens).strip(),
-        "tokens": tokens,
-        "has_legal_suffix": has_legal_suffix,
-    }
-
+Error reading file with 'cp1252': 'charmap' codec can't decode byte 0x81 in position 1166: character maps to <undefined>
 
 
 ================================================
@@ -1316,7 +1289,7 @@ Encoding utilities.
 
 The PEP export has a specific, known corruption: UTF-8 bytes that were
 decoded as Latin-1 at some point in the export pipeline, producing mojibake
-like 'CÃ®mpean' instead of 'Câmpean'. fix_mojibake() detects and repairs this.
+like 'CÃƒÂ®mpean' instead of 'CÃ¢mpean'. fix_mojibake() detects and repairs this.
 
 It is applied defensively across all three sources (PEP, sanctions, PSC)
 because there's no guarantee only one file is affected, but it is a no-op on
@@ -1328,10 +1301,10 @@ sanctions file) pass through unchanged.
 import re
 
 # A cheap heuristic pre-check: mojibake of this kind almost always produces
-# the byte sequence for 'Ã' (U+00C3) followed by another Latin-1 supplement
+# the byte sequence for 'Ãƒ' (U+00C3) followed by another Latin-1 supplement
 # character. If neither telltale character is present, skip the round-trip
 # entirely rather than risk corrupting genuinely clean text.
-_MOJIBAKE_HINT = re.compile(r"[ÃÂ]")
+_MOJIBAKE_HINT = re.compile(r"[ÃƒÃ‚]")
 
 
 def fix_mojibake(text: str) -> str:
@@ -1545,7 +1518,7 @@ def test_legal_suffix_equivalence():
 
 
 def test_accent_stripping():
-    result = normalize_name("Câmpean")
+    result = normalize_name("CÃ¢mpean")
     assert result["normalized"] == "campean"
 
 

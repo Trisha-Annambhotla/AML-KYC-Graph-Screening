@@ -12,8 +12,13 @@ Each row's name AND each semicolon-separated alias becomes its own seed row,
 tagged by source, so a match against an alias is distinguishable from a
 match against the canonical name during the manual spot-check.
 
+Also keeps birth_date (raw, ';'-separated, may be full dates or year-only),
+addresses and identifiers from the source row, repeated on every seed row of
+that entity. birth_date enables Mode A (birth-date) strong matching in
+src/matching.py.
+
 Run directly:
-    python src/sanctions_loader.py --input data/raw/fcdo_sanctions/gb_fcdo_sanctions_2026-08-02.csv \
+    python src/sanctions_loader.py --input data/raw/fcdo_sanctions/fcdo.csv \
                                     --output data/interim/sanctions_clean.csv
 """
 
@@ -27,7 +32,21 @@ from name_normalization import normalize_name
 OUTPUT_FIELDS = [
     "source_id", "schema", "seed_name", "seed_source", "normalized_name",
     "has_legal_suffix", "countries", "dataset",
+    "birth_date", "addresses", "identifiers",
 ]
+
+
+def _entity_fields(row: dict) -> dict:
+    """Fields shared by every seed row (canonical + aliases) of one entity."""
+    return {
+        "source_id": row.get("id", ""),
+        "schema": row.get("schema", ""),
+        "countries": row.get("countries", ""),
+        "dataset": row.get("dataset", ""),
+        "birth_date": (row.get("birth_date") or "").strip(),
+        "addresses": fix_mojibake((row.get("addresses") or "").strip()),
+        "identifiers": (row.get("identifiers") or "").strip(),
+    }
 
 
 def expand_rows(input_path: str):
@@ -35,18 +54,17 @@ def expand_rows(input_path: str):
     with open(input_path, encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            shared = _entity_fields(row)
+
             name = fix_mojibake((row.get("name") or "").strip())
             if name:
                 norm = normalize_name(name)
                 yield {
-                    "source_id": row.get("id", ""),
-                    "schema": row.get("schema", ""),
+                    **shared,
                     "seed_name": name,
                     "seed_source": "sanctions_canonical",
                     "normalized_name": norm["normalized"],
                     "has_legal_suffix": norm["has_legal_suffix"],
-                    "countries": row.get("countries", ""),
-                    "dataset": row.get("dataset", ""),
                 }
 
             for alias in (row.get("aliases") or "").split(";"):
@@ -57,19 +75,22 @@ def expand_rows(input_path: str):
                 if not norm["normalized"]:
                     continue
                 yield {
-                    "source_id": row.get("id", ""),
-                    "schema": row.get("schema", ""),
+                    **shared,
                     "seed_name": alias,
                     "seed_source": "sanctions_alias",
                     "normalized_name": norm["normalized"],
                     "has_legal_suffix": norm["has_legal_suffix"],
-                    "countries": row.get("countries", ""),
-                    "dataset": row.get("dataset", ""),
                 }
 
 
 def run(input_path: str, output_path: str):
-    counts = {"canonical_names": 0, "aliases": 0, "total_seed_rows": 0}
+    counts = {
+        "canonical_names": 0,
+        "aliases": 0,
+        "total_seed_rows": 0,
+        "rows_with_birth_date": 0,
+        "rows_with_addresses": 0,
+    }
     rows_out = []
     for row in expand_rows(input_path):
         rows_out.append(row)
@@ -78,6 +99,10 @@ def run(input_path: str, output_path: str):
             counts["canonical_names"] += 1
         else:
             counts["aliases"] += 1
+        if row["birth_date"]:
+            counts["rows_with_birth_date"] += 1
+        if row["addresses"]:
+            counts["rows_with_addresses"] += 1
 
     with open(output_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS)

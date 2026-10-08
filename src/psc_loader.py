@@ -2,7 +2,7 @@
 Companies House PSC snapshot loader.
 
 Reads whatever .txt (JSONL) parts are actually present in the snapshot
-directory -- currently just part 1 of 32 -- and logs coverage explicitly so
+directory (or a single .txt file) and logs coverage explicitly so
 match-count results are never silently treated as full-register figures.
 
 Handles both PSC record kinds seen in the snapshot:
@@ -10,11 +10,15 @@ Handles both PSC record kinds seen in the snapshot:
       or identity_verification_details.preferred_name if present.
     - corporate-entity-person-with-significant-control: name field directly.
 
+Also keeps birth_month / birth_year (individuals only; Companies House
+publishes month + year, never the full date). These enable Mode A
+(birth-date) strong matching in src/matching.py.
+
 Streams line-by-line (snapshot parts can be large) rather than loading the
 whole file into memory, and writes output incrementally.
 
 Run directly:
-    python src/psc_loader.py --input-dir data/raw/psc/psc_snapshot_2026-08-02 \
+    python src/psc_loader.py --input-dir data/raw/psc \
                               --output data/interim/psc_clean.csv \
                               --expected-parts 32
 """
@@ -32,7 +36,7 @@ from name_normalization import normalize_name
 OUTPUT_FIELDS = [
     "company_number", "kind", "name", "normalized_name", "has_legal_suffix",
     "address", "nationality", "country_of_residence", "notified_on",
-    "natures_of_control", "source_part",
+    "natures_of_control", "source_part", "birth_month", "birth_year",
 ]
 
 
@@ -81,6 +85,9 @@ def iter_psc_records(part_path: str, part_label: str):
                 continue
 
             norm = normalize_name(name)
+            # Companies House publishes only month + year of birth, and only
+            # for individual PSCs. Corporate PSCs have no date_of_birth.
+            dob = data.get("date_of_birth") or {}
             yield {
                 "company_number": rec.get("company_number", ""),
                 "kind": data.get("kind", ""),
@@ -93,11 +100,16 @@ def iter_psc_records(part_path: str, part_label: str):
                 "notified_on": data.get("notified_on", ""),
                 "natures_of_control": ";".join(data.get("natures_of_control", []) or []),
                 "source_part": part_label,
+                "birth_month": dob.get("month", ""),
+                "birth_year": dob.get("year", ""),
             }
 
 
 def run(input_dir: str, output_path: str, expected_parts: int = 32):
-    part_files = sorted(glob.glob(os.path.join(input_dir, "*.txt")))
+    if os.path.isfile(input_dir):
+        part_files = [input_dir]
+    else:
+        part_files = sorted(glob.glob(os.path.join(input_dir, "*.txt")))
 
     if not part_files:
         raise FileNotFoundError(f"No .txt parts found in {input_dir}")
@@ -111,7 +123,12 @@ def run(input_dir: str, output_path: str, expected_parts: int = 32):
             file=sys.stderr,
         )
 
-    counts = {"parts_processed": 0, "records_written": 0, "records_skipped_no_name": 0}
+    counts = {
+        "parts_processed": 0,
+        "records_written": 0,
+        "records_skipped_no_name": 0,
+        "records_with_birth_year": 0,
+    }
 
     with open(output_path, "w", encoding="utf-8", newline="") as out_f:
         writer = csv.DictWriter(out_f, fieldnames=OUTPUT_FIELDS)
@@ -124,6 +141,8 @@ def run(input_dir: str, output_path: str, expected_parts: int = 32):
             for record in iter_psc_records(part_path, part_label):
                 writer.writerow(record)
                 part_record_count += 1
+                if record["birth_year"] != "":
+                    counts["records_with_birth_year"] += 1
             counts["records_written"] += part_record_count
             counts["parts_processed"] += 1
             print(f"    -> {part_record_count} named PSC records", file=sys.stderr)
@@ -135,7 +154,8 @@ def run(input_dir: str, output_path: str, expected_parts: int = 32):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input-dir", required=True, help="Directory containing PSC snapshot .txt parts")
+    ap.add_argument("--input-dir", required=True,
+                    help="Directory containing PSC snapshot .txt parts, or a single .txt file")
     ap.add_argument("--output", required=True)
     ap.add_argument("--expected-parts", type=int, default=32)
     args = ap.parse_args()

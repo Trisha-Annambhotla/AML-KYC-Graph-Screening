@@ -69,6 +69,9 @@ final pipeline run (2026-10-08); sources are given for each.
     several companies (Peter Caruana): his companies have no other owner,
     so once he is removed there is nothing to link through
     (`docs/case_studies.md`, case 4).
+    All 52 positives are unreachable from other flagged owners
+    (`shortest_distance_to_flagged` = -1), so this distance was not added
+    to the models.
 12. **Feature twins: the four features cannot separate risky companies.**
     56% of all companies (229,197) have exactly the same four values (one
     owner, a two-node group, no shared address), including 22 of the 52

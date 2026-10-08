@@ -2,6 +2,8 @@ Directory structure:
 └── AML-KYC-Graph-Screening/
     ├── README.md
     ├── requirements.txt
+    ├── app/
+    │   └── dashboard.py
     ├── docs/
     │   ├── case_studies.md
     │   ├── feature_stats.md
@@ -22,6 +24,7 @@ Directory structure:
     │   ├── case_studies.py
     │   ├── features.py
     │   ├── graph_builder.py
+    │   ├── investigate.py
     │   ├── matching.py
     │   ├── name_normalization.py
     │   ├── pep_cleaning.py
@@ -34,6 +37,7 @@ Directory structure:
         ├── test_case_studies.py
         ├── test_features.py
         ├── test_graph_builder.py
+        ├── test_investigate.py
         ├── test_matching.py
         ├── test_name_normalization.py
         ├── test_pep_cleaning.py
@@ -76,6 +80,9 @@ src/
   features.py        Phase 3: four features and the label per company
   train.py           Phase 4: Logistic Regression vs Random Forest vs baselines
   case_studies.py    Phase 5: explain individual results
+  investigate.py     data logic for the dashboard (search, "Why this score?", network view)
+app/
+  dashboard.py       Streamlit investigation dashboard
 scripts/
   run_preprocessing.py   raw -> interim (needs data/raw/, which is not available)
   run_pipeline.py        Phases 1-5 on data/interim/
@@ -117,6 +124,33 @@ python src/spot_check.py score      # writes docs/match_precision.md
 
 **Do not run `scripts/run_preprocessing.py`**: the raw files are not
 available, and it would overwrite `data/interim/`.
+
+## How to run the dashboard
+
+An interactive dashboard for exploring the results. It reads the pipeline
+outputs, so run the pipeline once first.
+
+```bash
+python scripts/run_pipeline.py      # once, if data/processed/ is empty
+streamlit run app/dashboard.py      # opens http://localhost:8501
+```
+
+The first load takes about 30 seconds (it reads the ownership graph); after
+that it is cached. Pages:
+
+- **Overview**: number of companies and risky companies, list matches by
+  list and tier, and the Phase 4 metrics table.
+- **Investigate**: look up a company by number, or search an owner by name.
+  Shows its owners, list matches (tier and rule used), the four features
+  plus `shortest_distance_to_flagged`, the Random Forest and Logistic
+  Regression scores and ranks, a "Why this score?" list of plain-English
+  facts, and a network view up to 2 hops away (at most 150 nodes; it says
+  when the view is cut). The model scores are labelled experimental: they
+  are not predictive in this sample.
+- **Case studies**: the four cases from `docs/case_studies.md`, each with a
+  button that opens it in Investigate.
+
+The dashboard works offline (the network library is embedded in the page).
 
 ## Results
 
@@ -173,6 +207,346 @@ seaborn>=0.12
 jupyter>=1.0
 ipykernel>=6.25
 unidecode>=1.3
+streamlit>=1.65
+pyvis>=0.3.2
+
+
+
+================================================
+FILE: app/dashboard.py
+================================================
+"""
+Interactive investigation dashboard for the AML/KYC graph-screening project.
+
+Run from the project root (after `python scripts/run_pipeline.py`):
+    streamlit run app/dashboard.py
+
+Pages
+    Overview          key numbers, list matches, the Phase 4 metrics table
+    Investigate       search a company (by number or owner name): owners, list
+                      matches, features, model scores, "Why this score?",
+                      and a 2-hop network view (at most 150 nodes)
+    Case studies      the four Phase 5 cases, each opening in Investigate
+
+All data logic lives in src/investigate.py (tested); this file is the UI.
+"""
+
+import os
+import sys
+
+import pandas as pd
+import streamlit as st
+from pyvis.network import Network
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+import investigate as inv  # noqa: E402
+from train import METHOD_LABELS  # noqa: E402
+
+ROOT = inv.ROOT
+PAGES = ["Overview", "Investigate", "Case studies"]
+CASE_IMAGES = ["case_best_positive.png", "case_top_false_pos.png",
+               "case_typical_pos.png", "case_caruana_group.png"]
+
+# Reference palette (same as the report charts)
+C_COMPANY, C_PERSON, C_CORP, C_FLAG = "#2a78d6", "#eb6834", "#1baf7a", "#e34948"
+C_EDGE, C_INK = "#bdbcb6", "#0b0b0b"
+
+EXPERIMENTAL = (
+    "**Experimental -- not predictive in this sample.** Neither model beat the simple "
+    "baselines, and no method placed a single risky company in its top 1,000 "
+    "(see `results/metrics.md`, shown below). Treat these scores as a demonstration "
+    "of the method, not as a risk assessment."
+)
+
+st.set_page_config(page_title="AML/KYC graph screening", layout="wide")
+
+
+# ---------------------------------------------------------------------------
+# Cached data
+# ---------------------------------------------------------------------------
+
+@st.cache_resource(show_spinner="Loading the ownership graph (can take ~30 seconds)...")
+def get_graph():
+    return inv.load_graph()
+
+
+@st.cache_resource(show_spinner="Loading companies and scores...")
+def get_companies():
+    return inv.load_companies().set_index("company_number", drop=False)
+
+
+@st.cache_resource(show_spinner="Indexing owners...")
+def get_owners():
+    return inv.owner_index(get_graph())
+
+
+@st.cache_data
+def get_matches():
+    return inv.load_matches()
+
+
+@st.cache_data
+def get_metrics():
+    return inv.load_metrics()
+
+
+@st.cache_data
+def get_metrics_doc():
+    with open(inv.METRICS_DOC, encoding="utf-8") as f:
+        return f.read()
+
+
+@st.cache_resource(show_spinner="Selecting case studies...")
+def get_cases():
+    return inv.pick_cases(get_companies().reset_index(drop=True), get_graph())
+
+
+# ---------------------------------------------------------------------------
+# Navigation helpers
+# ---------------------------------------------------------------------------
+
+def open_company(company_number: str):
+    """Callback: switch to Investigate with this company selected."""
+    st.session_state["company"] = company_number
+    st.session_state["page"] = "Investigate"
+
+
+def on_company_number():
+    st.session_state["company"] = inv.normalise_company_number(
+        st.session_state.get("company_query", ""))
+
+
+# ---------------------------------------------------------------------------
+# Overview
+# ---------------------------------------------------------------------------
+
+def page_overview():
+    st.title("AML/KYC graph screening")
+    st.write("Companies House owners (1 of 32 PSC files) matched against the UK FCDO "
+             "sanctions list and a UK PEP list, turned into an ownership graph, and "
+             "scored by Logistic Regression and Random Forest.")
+    companies, matches = get_companies(), get_matches()
+    nums = inv.overview_numbers(companies, matches)
+    by_src = nums["positives_by_source"]
+
+    c = st.columns(4)
+    c[0].metric("Companies", f"{nums['companies']:,}")
+    c[1].metric("Risky companies (label = 1)", f"{nums['positives']}",
+                help="Directly owned by a strongly matched PEP or sanctioned owner.")
+    c[2].metric("of which PEP", f"{by_src.get('pep', 0) + by_src.get('both', 0)}")
+    c[3].metric("of which sanctions", f"{by_src.get('sanctions', 0) + by_src.get('both', 0)}")
+
+    st.subheader("List matches by list and tier")
+    st.caption("Strong matches become labels; weak matches (similar names only) are "
+               "reported but never used as labels.")
+    st.dataframe(nums["matches"], width="content")
+
+    st.subheader("Model comparison (Phase 4)")
+    st.caption("5-fold cross-validation grouped by split_group_id. PR-AUC is mean ± std "
+               "over folds; the @k columns use pooled out-of-fold scores.")
+    m = get_metrics()
+    view = pd.DataFrame({
+        "label run": m["run"].map({"main": "PEP + sanctions", "pep_only": "PEP only"}),
+        "method": m["method"].map(METHOD_LABELS),
+        "PR-AUC": [f"{a:.5f} ± {b:.5f}" for a, b in zip(m["pr_auc_mean"], m["pr_auc_std"])],
+        "ROC-AUC": m["roc_auc_mean"].round(3),
+        "hits@100": m["hits@100"], "hits@1000": m["hits@1000"],
+        "accuracy@0.5 (context)": m["accuracy_at_0_5"].round(3),
+    })
+    st.dataframe(view, hide_index=True, width="stretch")
+    st.warning("Neither model beats the baselines; no method puts a risky company in its "
+               "top 1,000. Full table and verdicts: `results/metrics.md`.")
+    with st.expander("results/metrics.md"):
+        st.markdown(get_metrics_doc())
+
+
+# ---------------------------------------------------------------------------
+# Investigate
+# ---------------------------------------------------------------------------
+
+def search_panel():
+    left, right = st.columns(2)
+    with left:
+        st.text_input("Company number", key="company_query", on_change=on_company_number,
+                      placeholder="e.g. 10277215 or SC447141")
+    with right:
+        q = st.text_input("Owner name (at least 3 letters)", key="owner_query",
+                          placeholder="e.g. Caruana")
+    if q:
+        hits = inv.search_owners(get_owners(), q)
+        if hits.empty:
+            st.info("No owner found.")
+            return
+        labels = [f"{r.name}  ({r.n_companies} compan{'y' if r.n_companies == 1 else 'ies'})"
+                  + (f"  [FLAGGED {r.flag_source.upper()}]" if r.flagged else "")
+                  for r in hits.itertuples()]
+        pick = st.selectbox(f"{len(hits)} owner(s) found (max 50 shown)", range(len(hits)),
+                            format_func=lambda i: labels[i])
+        owner = hits.iloc[pick]["node_id"]
+        cos = sorted(c.removeprefix("company:") for c in get_graph().successors(owner))
+        col_a, col_b = st.columns([3, 1])
+        chosen = col_a.selectbox("Their companies", cos)
+        col_b.button("Investigate", on_click=open_company, args=(chosen,),
+                     width="stretch")
+
+
+def legend_html() -> str:
+    def chip(color, shape, text, ring=None):
+        radius = "50%" if shape == "circle" else "2px"
+        rot = "transform:rotate(45deg);" if shape == "diamond" else ""
+        border = f"3px solid {ring}" if ring else f"1px solid {color}"
+        return (f'<span style="display:inline-flex;align-items:center;margin-right:16px">'
+                f'<span style="width:12px;height:12px;background:{color};border:{border};'
+                f'border-radius:{radius};{rot}display:inline-block;margin-right:6px"></span>'
+                f'{text}</span>')
+    return ("<div style='font-size:0.85rem'>"
+            + chip(C_COMPANY, "square", "Company")
+            + chip(C_PERSON, "circle", "Person (PSC)")
+            + chip(C_CORP, "diamond", "Corporate PSC")
+            + chip(C_FLAG, "circle", "Flagged owner (PEP / sanctions)")
+            + chip(C_COMPANY, "square", "Risky company (red ring)", ring=C_FLAG)
+            + chip(C_COMPANY, "square", "Selected company (black ring)", ring=C_INK)
+            + "</div>")
+
+
+def _safe(text: str) -> str:
+    """Names come from public data and end up inside pyvis's <script> block;
+    dropping angle brackets means no name can close the script tag."""
+    return str(text).replace("<", "").replace(">", "")
+
+
+def network_html(graph, center: str, companies) -> tuple:
+    sub, total, truncated = inv.ego_network(graph, center)
+    net = Network(height="560px", width="100%", directed=True, bgcolor="#fcfcfb",
+                  font_color=C_INK, cdn_resources="in_line")
+    for n, d in sub.nodes(data=True):
+        t = d["node_type"]
+        if t == "company":
+            num = _safe(n.removeprefix("company:"))
+            risky = num in companies.index and int(companies.at[num, "label"]) == 1
+            border = C_INK if n == center else (C_FLAG if risky else C_COMPANY)
+            net.add_node(n, label=num, shape="square", size=22 if n == center else 12,
+                         color={"background": C_COMPANY, "border": border},
+                         borderWidth=4 if (n == center or risky) else 1,
+                         title=f"Company {num}" + (" (risky, label 1)" if risky else ""))
+        else:
+            flagged = d.get("flagged")
+            color = C_FLAG if flagged else (C_PERSON if t == "person" else C_CORP)
+            name = _safe(d["name"])
+            net.add_node(n, label=name if len(name) <= 24 else name[:23] + "…",
+                         shape="dot" if t == "person" else "diamond", size=12,
+                         color={"background": color, "border": color},
+                         title=(f"{name}" + (f" -- FLAGGED ({d['flag_source'].upper()})"
+                                             if flagged else "")
+                                + f"\ncontrols {graph.out_degree(n)} compan"
+                                + ("y" if graph.out_degree(n) == 1 else "ies")))
+    for u, v in sub.edges():
+        net.add_edge(u, v, color=C_EDGE, arrows="to")
+    net.set_options('{"physics": {"stabilization": {"iterations": 200}}, '
+                    '"interaction": {"hover": true}}')
+    # pyvis's template also loads Bootstrap from a CDN for menus this view does not
+    # use; drop it so the dashboard works offline and makes no outside requests.
+    html = "\n".join(line for line in net.generate_html().splitlines()
+                     if "cdn.jsdelivr.net/npm/bootstrap" not in line)
+    return html, len(sub), total, truncated
+
+
+def page_investigate():
+    st.title("Investigate a company")
+    search_panel()
+    company = st.session_state.get("company")
+    if not company:
+        st.info("Enter a company number, or search for an owner and pick one of their "
+                "companies. The Case studies page has four good starting points.")
+        return
+    companies, graph = get_companies(), get_graph()
+    if company not in companies.index:
+        st.error(f"Company {company} is not in this sample (1 of 32 PSC files).")
+        return
+    row = companies.loc[company]
+    label = int(row["label"])
+    st.header(f"Company {company}")
+    st.markdown(
+        f"**Label:** {'RISKY (label 1, ' + row['label_source'] + ')' if label else 'not risky (label 0)'}"
+        f" · [Companies House page](https://find-and-update.company-information.service.gov.uk"
+        f"/company/{company}/persons-with-significant-control)")
+
+    matches = inv.company_matches(get_matches(), company)
+    twin = inv.twins(companies.reset_index(drop=True), row)
+
+    st.subheader("Why this score?")
+    st.markdown("\n".join(f"- {fact}" for fact in inv.explain(row, matches, twin)))
+
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Owners")
+        st.dataframe(inv.company_owners(graph, company), hide_index=True, width="stretch")
+        st.subheader("List matches")
+        if matches.empty:
+            st.write("No owner of this company matched either list.")
+        else:
+            st.dataframe(pd.DataFrame({
+                "owner": matches["psc_name"],
+                "list": matches["list_source"].map(inv.LIST_NAMES),
+                "list entry": matches["list_name"],
+                "tier": matches["tier"], "rule used": matches["rule_used"],
+                "score": matches["score"],
+                "why": [inv.match_reason(r) for r in matches.to_dict("records")],
+            }), hide_index=True, width="stretch")
+    with right:
+        st.subheader("Features")
+        st.dataframe(inv.feature_table(row), hide_index=True, width="stretch")
+        st.subheader("Model scores (out-of-fold)")
+        st.warning(EXPERIMENTAL)
+        st.dataframe(inv.score_table(row, len(companies)), hide_index=True, width="stretch")
+        with st.expander("results/metrics.md"):
+            st.markdown(get_metrics_doc())
+
+    st.subheader(f"Network: up to {inv.MAX_HOPS} hops around {company}")
+    html, shown, total, truncated = network_html(graph, "company:" + company, companies)
+    if truncated:
+        st.info(f"Showing {shown} of {total:,} nodes within {inv.MAX_HOPS} hops: the view "
+                f"is capped at {inv.MAX_NODES} nodes (closest and flagged nodes first).")
+    else:
+        st.caption(f"All {total} nodes within {inv.MAX_HOPS} hops. Address links are not "
+                   "drawn (addresses are not nodes in the ownership graph).")
+    st.markdown(legend_html(), unsafe_allow_html=True)
+    st.iframe(html, height=580)
+
+
+# ---------------------------------------------------------------------------
+# Case studies
+# ---------------------------------------------------------------------------
+
+def page_cases():
+    st.title("Case studies")
+    st.write("The four cases from `docs/case_studies.md`. No risky company ranked highly, "
+             "so they explain why the models failed.")
+    for (title, company, summary), img in zip(get_cases(), CASE_IMAGES):
+        st.subheader(title)
+        st.write(summary)
+        cols = st.columns([1, 3])
+        cols[0].button(f"Open {company} in Investigate", key=f"case_{company}",
+                       on_click=open_company, args=(company,))
+        path = os.path.join(ROOT, "results", img)
+        if os.path.exists(path):
+            with cols[1].expander("Static drawing from the report"):
+                st.image(path)
+
+
+# ---------------------------------------------------------------------------
+
+if "page" not in st.session_state:
+    st.session_state["page"] = "Overview"
+st.sidebar.radio("Page", PAGES, key="page")
+st.sidebar.caption("Data: 1 of 32 Companies House PSC files (2026-08-02 snapshot). "
+                   "Labels: strong PEP / sanctions matches (Mode A). The manual "
+                   "spot-check of matches is still pending.")
+
+{"Overview": page_overview, "Investigate": page_investigate,
+ "Case studies": page_cases}[st.session_state["page"]]()
+
 
 
 ================================================
@@ -714,6 +1088,9 @@ final pipeline run (2026-10-08); sources are given for each.
     several companies (Peter Caruana): his companies have no other owner,
     so once he is removed there is nothing to link through
     (`docs/case_studies.md`, case 4).
+    All 52 positives are unreachable from other flagged owners
+    (`shortest_distance_to_flagged` = -1), so this distance was not added
+    to the models.
 12. **Feature twins: the four features cannot separate risky companies.**
     56% of all companies (229,197) have exactly the same four values (one
     owner, a two-node group, no shared address), including 22 of the 52
@@ -2719,6 +3096,278 @@ if __name__ == "__main__":
     print(f"  unmapped strong matches: {len(result['unmapped'])}", file=sys.stderr)
     print(f"Graph written to: {GRAPH_OUTPUT}", file=sys.stderr)
     print(f"Stats written to: {STATS_OUTPUT}", file=sys.stderr)
+
+
+
+================================================
+FILE: src/investigate.py
+================================================
+"""
+Data logic for the investigation dashboard (app/dashboard.py).
+
+Kept free of Streamlit so it can be tested: search, a company's owners and
+list matches, the plain-English "Why this score?" facts, and a 2-hop network
+neighbourhood capped at a maximum number of nodes.
+"""
+
+import os
+import pickle
+
+import networkx as nx
+import pandas as pd
+
+import case_studies
+from features import ADDRESS_KEY_MAX_COMPANIES, FEATURES, MAX_FLAG_DISTANCE
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+PROCESSED = os.path.join(ROOT, "data", "processed")
+GRAPH_INPUT = os.path.join(PROCESSED, "graph.pkl")
+MATCHES_INPUT = os.path.join(PROCESSED, "matches.csv")
+METRICS_INPUT = os.path.join(ROOT, "results", "metrics.csv")
+METRICS_DOC = os.path.join(ROOT, "results", "metrics.md")
+
+MAX_HOPS = 2
+MAX_NODES = 150
+
+LIST_NAMES = {"pep": "PEP", "sanctions": "sanctions"}
+
+
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
+
+def load_graph(path: str = GRAPH_INPUT) -> nx.DiGraph:
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def load_companies() -> pd.DataFrame:
+    """features.csv + out-of-fold scores + ranks (same tie-break as Phase 4)."""
+    return case_studies.load_table()
+
+
+def load_matches(path: str = MATCHES_INPUT) -> pd.DataFrame:
+    return pd.read_csv(path, dtype={"company_number": str}, keep_default_na=False)
+
+
+def load_metrics(path: str = METRICS_INPUT) -> pd.DataFrame:
+    return pd.read_csv(path)
+
+
+def owner_index(graph: nx.DiGraph) -> pd.DataFrame:
+    """One row per owner (PSC) node: id, name, type, flags, number of companies."""
+    rows = [(n, d["name"], d["node_type"], d.get("flagged", False), d.get("flag_source", ""),
+             graph.out_degree(n))
+            for n, d in graph.nodes(data=True) if d["node_type"] != "company"]
+    return pd.DataFrame(rows, columns=["node_id", "name", "node_type", "flagged",
+                                       "flag_source", "n_companies"])
+
+
+# ---------------------------------------------------------------------------
+# Search
+# ---------------------------------------------------------------------------
+
+def normalise_company_number(text: str) -> str:
+    """'7434180' -> '07434180'; 'sc447141' -> 'SC447141'."""
+    t = (text or "").strip().upper().replace(" ", "")
+    return t.zfill(8) if t.isdigit() else t
+
+
+def search_owners(owners: pd.DataFrame, query: str, limit: int = 50) -> pd.DataFrame:
+    q = (query or "").strip().lower()
+    if len(q) < 3:
+        return owners.iloc[0:0]
+    hits = owners[owners["name"].str.lower().str.contains(q, regex=False)]
+    return hits.sort_values(["flagged", "n_companies"], ascending=False).head(limit)
+
+
+# ---------------------------------------------------------------------------
+# One company
+# ---------------------------------------------------------------------------
+
+def company_owners(graph: nx.DiGraph, company_number: str) -> pd.DataFrame:
+    node = "company:" + company_number
+    rows = []
+    for p in graph.predecessors(node):
+        d, e = graph.nodes[p], graph.edges[p, node]
+        rows.append({
+            "owner": d["name"], "type": d["node_type"],
+            "flagged": d.get("flag_source", "") or "",
+            "weak_flagged": d.get("weak_flag_source", "") or "",
+            "controls_companies": graph.out_degree(p),
+            "address_key": e.get("address_key", ""),
+            "natures_of_control": e.get("natures_of_control", ""),
+        })
+    return pd.DataFrame(rows)
+
+
+def company_matches(matches: pd.DataFrame, company_number: str) -> pd.DataFrame:
+    m = matches[matches["company_number"] == company_number]
+    return m.sort_values(["tier", "score"], ascending=[True, False])
+
+
+def match_reason(row) -> str:
+    """Plain-English reason a list match is strong or weak."""
+    who = "company name" if str(row["kind"]).startswith("corporate") else "name"
+    if row["tier"] == "strong":
+        if row["rule_used"] == "A":
+            return f"{who} similarity {float(row['score']):.0f}/100 and birth month/year agree"
+        if who == "company name":
+            return "exact company name match (2+ real words)"
+        return "exact name (3+ words) and nationality consistent with the list"
+    return (f"{who} similarity {float(row['score']):.0f}/100 only -- not enough to count "
+            "as the same person (weak; not used as a label)")
+
+
+def twins(companies: pd.DataFrame, row) -> dict:
+    """Companies with exactly the same four model features."""
+    return case_studies.feature_twins(companies, row)
+
+
+def explain(row, matches: pd.DataFrame, twin: dict) -> list:
+    """
+    Plain-English facts behind a company's label and score, built only from
+    the data. `row`: the company's features.csv row (+ ranks); `matches`:
+    its rows from matches.csv; `twin`: feature_twins() output.
+    """
+    facts = []
+    strong = matches[matches["tier"] == "strong"]
+    weak = matches[matches["tier"] == "weak"]
+    for r in strong.itertuples():
+        facts.append(f"Owner {r.psc_name} matched to the {LIST_NAMES.get(r.list_source, r.list_source)} "
+                     f"list entry '{r.list_name}' ({match_reason(r._asdict())}).")
+    if len(weak):
+        facts.append(f"{len(weak)} weak name match{'es' if len(weak) > 1 else ''} "
+                     "(similar names only; not used as labels).")
+    if int(row["label"]) == 1:
+        facts.append("Labelled risky: it is directly owned by a strongly flagged owner.")
+    else:
+        facts.append("Not labelled risky: none of its owners is strongly flagged.")
+
+    deg = int(row["degree"])
+    facts.append(f"Has {deg} owner{'s' if deg != 1 else ''} (PSCs).")
+
+    sa = int(row["shared_address_count"])
+    if sa:
+        facts.append(f"Shares an owner address with {sa:,} other compan{'y' if sa == 1 else 'ies'}.")
+    else:
+        facts.append("Shares no owner address with other companies (addresses used by more "
+                     f"than {ADDRESS_KEY_MAX_COMPANIES} companies are ignored).")
+
+    fn = int(row["flagged_neighbour_companies"])
+    if fn:
+        facts.append(f"Linked to {fn} other risky compan{'y' if fn == 1 else 'ies'} through a "
+                     "non-flagged owner or a shared address.")
+
+    dist = int(row["shortest_distance_to_flagged"])
+    if dist == -1:
+        facts.append("No connection to any other flagged owner.")
+    elif dist >= MAX_FLAG_DISTANCE:
+        facts.append(f"{MAX_FLAG_DISTANCE + 1} or more hops from a flagged owner "
+                     "(not counting its own owners).")
+    else:
+        facts.append(f"{dist} hops from a flagged owner (not counting its own owners).")
+
+    cs = int(row["component_size"])
+    facts.append(f"Its ownership group has {cs:,} nodes (companies and owners).")
+    if bool(row.get("is_hub_component", False)):
+        facts.append("Its group contains an owner who controls 100+ companies "
+                     "(often a formation agent).")
+
+    others = twin["n"] - 1
+    facts.append(f"{others:,} other compan{'y has' if others == 1 else 'ies have'} exactly the same "
+                 f"feature profile ({twin['positives']} of the {twin['n']:,} with this profile "
+                 "are risky), so a model using these four features cannot tell them apart.")
+    return facts
+
+
+# ---------------------------------------------------------------------------
+# Network view
+# ---------------------------------------------------------------------------
+
+def ego_network(graph: nx.DiGraph, center: str, max_hops: int = MAX_HOPS,
+                max_nodes: int = MAX_NODES):
+    """
+    Nodes within `max_hops` of `center` (undirected), at most `max_nodes`.
+    Closer nodes first; within a hop, flagged owners and risky-looking nodes
+    first, then by id (deterministic). Returns (subgraph, total_in_reach,
+    truncated).
+    """
+    max_hops = min(max_hops, MAX_HOPS)  # never more than 2 hops
+    und = graph.to_undirected(as_view=True)
+    levels, seen, frontier = [[center]], {center}, [center]
+    for _ in range(max_hops):
+        nxt = set()
+        for n in frontier:
+            nxt.update(m for m in und.neighbors(n) if m not in seen)
+        seen |= nxt
+        frontier = sorted(nxt, key=lambda m: (not graph.nodes[m].get("flagged"), m))
+        levels.append(frontier)
+    total = len(seen)
+    keep = []
+    for level in levels:
+        for n in level:
+            if len(keep) >= max_nodes:
+                break
+            keep.append(n)
+    sub = graph.subgraph(keep).copy()
+    return sub, total, total > len(keep)
+
+
+def score_table(row, n: int) -> pd.DataFrame:
+    names = {"random_forest": "Random Forest", "logistic_regression": "Logistic Regression"}
+    return pd.DataFrame([
+        {"model": names[m], "score": round(float(row[f"score_{m}"]), 4),
+         "rank": f"{int(row[f'rank_{m}']):,} of {n:,}"}
+        for m in names
+    ])
+
+
+def feature_table(row) -> pd.DataFrame:
+    cols = FEATURES + ["shortest_distance_to_flagged"]
+    return pd.DataFrame({"feature": cols,
+                         "value": [int(row[c]) for c in cols],
+                         "used by the models": ["yes"] * len(FEATURES) + ["no (analysis only)"]})
+
+
+def overview_numbers(companies: pd.DataFrame, matches: pd.DataFrame) -> dict:
+    return {
+        "companies": len(companies),
+        "positives": int(companies["label"].sum()),
+        "positives_by_source": companies.loc[companies["label"] == 1, "label_source"]
+        .value_counts().to_dict(),
+        "matches": pd.crosstab(matches["list_source"], matches["tier"], margins=True,
+                               margins_name="total"),
+    }
+
+
+def pick_cases(companies: pd.DataFrame, graph: nx.DiGraph) -> list:
+    """The 4 Phase 5 cases as (title, company_number, one-line summary)."""
+    cases = case_studies.select_cases(companies, graph)
+    caruana = cases["caruana_group"]
+    car_first = sorted(graph.successors(caruana))[0].removeprefix("company:")
+    by = companies.set_index("company_number")
+
+    def ranks(c):
+        r = by.loc[c]
+        return f"RF rank {int(r['rank_random_forest']):,}, LR rank {int(r['rank_logistic_regression']):,}"
+
+    best = cases["best_positive"].removeprefix("company:")
+    fp = cases["top_false_pos"].removeprefix("company:")
+    typ = cases["typical_pos"].removeprefix("company:")
+    return [
+        ("1. The best-ranked risky company", best,
+         f"The risky company the models ranked highest -- still only {ranks(best)}."),
+        ("2. The highest-scoring false positive", fp,
+         f"Random Forest's top company is not risky ({ranks(fp)}): it has exactly the same "
+         "profile as Peter Caruana's risky companies."),
+        ("3. A typical risky company", typ,
+         f"Has the most common profile of all; indistinguishable from ordinary companies "
+         f"({ranks(typ)})."),
+        ("4. Peter Caruana's group", car_first,
+         f"The one flagged owner with several companies ({graph.out_degree(caruana)}); his "
+         f"companies rank near the bottom ({ranks(car_first)})."),
+    ]
 
 
 
@@ -4860,6 +5509,127 @@ def test_address_helpers():
     assert address_key("Im Grund 12, Germany") == "im grund 12, germany"
     assert psc_node_id(CORP, "electra pro", "Moscow") == "corp:electra pro"
     assert psc_node_id(IND, "a b c", "Im Grund 12") == "person:a b c|im grund 12"
+
+
+
+================================================
+FILE: tests/test_investigate.py
+================================================
+import os
+import sys
+
+import networkx as nx
+import pandas as pd
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+import investigate as inv  # noqa: E402
+
+
+def _row(**kw):
+    base = {"label": 0, "degree": 1, "shared_address_count": 0,
+            "flagged_neighbour_companies": 0, "component_size": 2,
+            "shortest_distance_to_flagged": -1, "is_hub_component": False}
+    base.update(kw)
+    return pd.Series(base)
+
+
+def _matches(rows=()):
+    return pd.DataFrame(list(rows), columns=["psc_name", "list_source", "list_name", "tier",
+                                             "rule_used", "score", "kind"])
+
+
+TWIN = {"n": 229197, "positives": 22, "rate": 22 / 229197}
+
+
+def test_strong_pep_match_mode_a_is_explained():
+    m = _matches([("Jack Dromey", "pep", "Jack Dromey", "strong", "A", 100.0,
+                   "individual-person-with-significant-control")])
+    facts = inv.explain(_row(label=1, degree=3), m, TWIN)
+    assert any("matched to the PEP list entry 'Jack Dromey'" in f
+               and "birth month/year agree" in f for f in facts)
+    assert any(f.startswith("Labelled risky") for f in facts)
+    assert "Has 3 owners (PSCs)." in facts
+
+
+def test_unreachable_distance_says_no_connection():
+    facts = inv.explain(_row(), _matches(), TWIN)
+    assert "No connection to any other flagged owner." in facts
+
+
+def test_distance_and_cap_wording():
+    assert "3 hops from a flagged owner (not counting its own owners)." in \
+        inv.explain(_row(shortest_distance_to_flagged=3), _matches(), TWIN)
+    assert any(f.startswith("7 or more hops") for f in
+               inv.explain(_row(shortest_distance_to_flagged=6), _matches(), TWIN))
+
+
+def test_shared_address_and_twins_wording():
+    facts = inv.explain(_row(shared_address_count=17), _matches(), TWIN)
+    assert "Shares an owner address with 17 other companies." in facts
+    assert any(f.startswith("229,196 other companies have exactly the same feature profile")
+               and "22 of the 229,197" in f for f in facts)
+    one = inv.explain(_row(shared_address_count=1), _matches(), {"n": 2, "positives": 0})
+    assert "Shares an owner address with 1 other company." in one
+    assert any(f.startswith("1 other company has exactly the same feature profile")
+               for f in one)
+
+
+def test_no_shared_address_mentions_cap():
+    facts = inv.explain(_row(), _matches(), TWIN)
+    assert any("Shares no owner address" in f and "more than 50 companies" in f for f in facts)
+
+
+def test_weak_and_company_matches():
+    m = _matches([
+        ("Electra Pro Ltd", "sanctions", "ELECTRA PRO LLC", "strong", "B", 100.0,
+         "corporate-entity-person-with-significant-control"),
+        ("John Smith", "pep", "John Smyth", "weak", "A", 91.0,
+         "individual-person-with-significant-control"),
+        ("John Smith", "sanctions", "John SMITH", "weak", "A", 100.0,
+         "individual-person-with-significant-control"),
+    ])
+    facts = inv.explain(_row(label=1), m, TWIN)
+    assert any("sanctions list entry 'ELECTRA PRO LLC'" in f
+               and "exact company name match" in f for f in facts)
+    assert "2 weak name matches (similar names only; not used as labels)." in facts
+
+
+def test_hub_and_feature1_facts():
+    facts = inv.explain(_row(is_hub_component=True, flagged_neighbour_companies=1),
+                        _matches(), TWIN)
+    assert any("controls 100+ companies" in f for f in facts)
+    assert any(f.startswith("Linked to 1 other risky company") for f in facts)
+
+
+def test_normalise_company_number():
+    assert inv.normalise_company_number(" 7434180 ") == "07434180"
+    assert inv.normalise_company_number("sc447141") == "SC447141"
+
+
+def test_ego_network_caps_nodes_and_hops():
+    g = nx.DiGraph()
+    g.add_node("company:C", node_type="company")
+    g.add_node("person:P", node_type="person", name="P", flagged=False)
+    g.add_edge("person:P", "company:C")
+    for i in range(200):  # P controls 200 other companies (2 hops from C)
+        g.add_node(f"company:X{i:03d}", node_type="company")
+        g.add_edge("person:P", f"company:X{i:03d}")
+    g.add_node("person:Far", node_type="person", name="Far", flagged=True)
+    g.add_edge("person:Far", "company:X000")  # 3 hops from C: never shown
+    sub, total, truncated = inv.ego_network(g, "company:C", max_hops=5)
+    assert "person:Far" not in sub          # max_hops is clamped to 2
+    assert len(sub) == inv.MAX_NODES and truncated
+    assert total == 202                     # C + P + 200 companies
+    assert "company:C" in sub and "person:P" in sub
+
+
+def test_search_owners():
+    owners = pd.DataFrame({"node_id": ["a", "b", "c"], "name": ["Peter Caruana", "Peter Pan", "Al"],
+                           "node_type": "person", "flagged": [True, False, False],
+                           "flag_source": ["pep", "", ""], "n_companies": [8, 1, 1]})
+    assert inv.search_owners(owners, "peter")["node_id"].tolist() == ["a", "b"]
+    assert inv.search_owners(owners, "al").empty  # fewer than 3 letters
 
 
 

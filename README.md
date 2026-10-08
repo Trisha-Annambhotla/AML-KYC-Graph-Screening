@@ -31,6 +31,9 @@ src/
   features.py        Phase 3: four features and the label per company
   train.py           Phase 4: Logistic Regression vs Random Forest vs baselines
   case_studies.py    Phase 5: explain individual results
+  investigate.py     data logic for the dashboard (search, "Why this score?", network view)
+app/
+  dashboard.py       Streamlit investigation dashboard
 scripts/
   run_preprocessing.py   raw -> interim (needs data/raw/, which is not available)
   run_pipeline.py        Phases 1-5 on data/interim/
@@ -72,6 +75,33 @@ python src/spot_check.py score      # writes docs/match_precision.md
 
 **Do not run `scripts/run_preprocessing.py`**: the raw files are not
 available, and it would overwrite `data/interim/`.
+
+## How to run the dashboard
+
+An interactive dashboard for exploring the results. It reads the pipeline
+outputs, so run the pipeline once first.
+
+```bash
+python scripts/run_pipeline.py      # once, if data/processed/ is empty
+streamlit run app/dashboard.py      # opens http://localhost:8501
+```
+
+The first load takes about 30 seconds (it reads the ownership graph); after
+that it is cached. Pages:
+
+- **Overview**: number of companies and risky companies, list matches by
+  list and tier, and the Phase 4 metrics table.
+- **Investigate**: look up a company by number, or search an owner by name.
+  Shows its owners, list matches (tier and rule used), the four features
+  plus `shortest_distance_to_flagged`, the Random Forest and Logistic
+  Regression scores and ranks, a "Why this score?" list of plain-English
+  facts, and a network view up to 2 hops away (at most 150 nodes; it says
+  when the view is cut). The model scores are labelled experimental: they
+  are not predictive in this sample.
+- **Case studies**: the four cases from `docs/case_studies.md`, each with a
+  button that opens it in Investigate.
+
+The dashboard works offline (the network library is embedded in the page).
 
 ## Results
 
